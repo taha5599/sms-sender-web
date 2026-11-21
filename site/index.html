@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>إرسال رسائل SMS</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>إرسال رسائل SMS</h1>
+  <p class="subtitle">من ملف Excel عبر فلاشة USB على جهازك — الرسائل والأرقام لا تصل إلى أي خادم</p>
+  <div id="bridgeStatus" class="status unknown">جارٍ التحقق من الوسيط…</div>
+  <div id="bridgeHelp" class="help hidden">
+    <p><strong>الوسيط لا يعمل.</strong>
+    شغّل برنامج <code>SmsSenderBridge.exe</code> على جهاز الكمبيوتر أولاً،
+    ثم اضغط «إعادة التحقق». الوسيط يجب أن يكون شغالاً أثناء الإرسال،
+    والفلاشة موصولة بالجهاز.</p>
+    <button id="btnRecheck" type="button">إعادة التحقق</button>
+  </div>
+</header>
+
+<main>
+  <!-- المودمات -->
+  <section id="modemsSection">
+    <h2>المودمات</h2>
+    <div class="row">
+      <button id="btnRefreshPorts" type="button">تحديث المنافذ</button>
+      <button id="btnDetect" type="button">كشف تلقائي</button>
+      <button id="btnTest" type="button" disabled>اختبار الاتصال</button>
+      <label class="checkall"><input type="checkbox" id="chkAll"> تحديد الكل</label>
+    </div>
+    <p class="hint">«كشف تلقائي» يجرّب كل منفذ ويرسل AT، ويعلّم كل مودم يرد. المودمات المكتشفة معلّمة افتراضياً. الإرسال يوزّع الأرقام بالتناوب على كل المودمات المعلّمة (رقم 1 ← مودم أ، رقم 2 ← مودم ب، …).</p>
+    <div id="modemList" class="modem-list"><p class="empty">لا توجد مودمات بعد — اضغط «كشف تلقائي».</p></div>
+    <div id="testResults" class="test-results"></div>
+  </section>
+
+  <!-- الملف -->
+  <section id="fileSection">
+    <h2>ملف الأرقام</h2>
+    <div class="row">
+      <input type="file" id="fileInput" accept=".xlsx,.xlsm,.csv">
+      <button id="btnPreview" type="button" disabled>معاينة الأرقام</button>
+    </div>
+    <p class="hint">ملف Excel (.xlsx أو .xlsm) أو CSV فيه أرقام مصرية فقط (عمود واحد يكفي). يُرسل الملف مباشرة إلى الوسيط على جهازك، وهو الذي يقرؤه — لا يُرفع إلى أي موقع.</p>
+    <div id="previewCounts" class="counts"></div>
+    <div class="table-wrap">
+      <table id="previewTable" class="hidden">
+        <thead><tr><th>#</th><th>الرقم</th><th>الحالة</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- الرسالة -->
+  <section id="messageSection">
+    <h2>نص الرسالة</h2>
+    <textarea id="messageInput" rows="4" placeholder="اكتب نص الرسالة هنا…"></textarea>
+    <div class="row">
+      <label>الفاصل بين الرسائل:
+        <select id="delaySelect">
+          <option value="2">ثانيتان</option>
+          <option value="3">3 ثوانٍ</option>
+          <option value="5" selected>5 ثوانٍ</option>
+          <option value="10">10 ثوانٍ</option>
+          <option value="15">15 ثانية</option>
+          <option value="20">20 ثانية</option>
+          <option value="30">30 ثانية</option>
+        </select>
+      </label>
+      <span id="charCount" class="hint"></span>
+    </div>
+  </section>
+
+  <!-- الإرسال -->
+  <section id="sendSection">
+    <div class="row">
+      <button id="btnSend" type="button" class="big" disabled>إرسال</button>
+      <button id="btnStop" type="button" class="danger hidden">إيقاف</button>
+    </div>
+    <div id="progressArea" class="hidden">
+      <div class="progress-total">
+        <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+        <div id="progressText" class="hint">0 / 0</div>
+      </div>
+      <div id="modemProgress"></div>
+    </div>
+    <div id="logBox" class="log hidden" dir="ltr"></div>
+    <div class="table-wrap">
+      <table id="resultsTable" class="hidden">
+        <thead><tr><th>#</th><th>الرقم</th><th>المودم</th><th>الحالة</th><th>ملاحظة</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="sendError" class="error hidden"></div>
+  </section>
+</main>
+
+<footer>
+  <p class="hint">الإصدار 1.0-web — يعمل مع الوسيط SmsSenderBridge على جهازك. لا حسابات، لا تخزين على أي خادم.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
