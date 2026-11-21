@@ -253,7 +253,7 @@ function sendJob() {
   var fd = new FormData();
   fd.append('file', file);
   fd.append('message', message);
-  fd.append('delaySeconds', $('delaySelect').value);
+  fd.append('delaySeconds', getDelaySeconds());
   fd.append('ports', ports.join(','));
   clearError();
   // (Round 61) C-60-M2/B-60-M1: disable the send button BEFORE the request, not in .then - a double-click fired
@@ -363,6 +363,33 @@ function updateCharCount() {
 
 /* ---------------- wiring ---------------- */
 
+/* (R76) delay: the user types the seconds or taps a preset.
+   (R76b) No upper cap: 2 seconds minimum, up to 86400 (24h) — the
+   86400 is only the overflow guard, mirroring the bridge.
+   Clamp lives in getDelaySeconds() — called at send time, on change
+   (blur/Enter) and on restore — NOT on every keystroke, so typing "12"
+   is never rewritten to "2" mid-typing. The value is saved to
+   localStorage raw on input (same pattern as the message, W1) and
+   restored on the next visit. */
+var DELAY_KEY = 'smsSenderDelay';
+function getDelaySeconds() {
+  var v = parseInt($('delayInput').value, 10);
+  if (isNaN(v)) v = 5;
+  if (v < 2) v = 2;
+  if (v > 86400) v = 86400;
+  $('delayInput').value = v;
+  return v;
+}
+function saveDelay() {
+  try { localStorage.setItem(DELAY_KEY, $('delayInput').value); } catch (e) { /* storage unavailable */ }
+}
+function restoreDelay() {
+  try {
+    var saved = localStorage.getItem(DELAY_KEY);
+    if (saved !== null && saved !== '') { $('delayInput').value = saved; getDelaySeconds(); }
+  } catch (e) { /* storage unavailable */ }
+}
+
 $('btnRecheck').addEventListener('click', function () { checkBridge(true); });
 $('btnRefreshPorts').addEventListener('click', loadPorts);
 $('btnDetect').addEventListener('click', detectModems);
@@ -389,6 +416,16 @@ function restoreMessage() {
 $('messageInput').addEventListener('input', updateCharCount);
 $('messageInput').addEventListener('input', saveMessage);
 restoreMessage();
+$('delayInput').addEventListener('input', saveDelay);
+$('delayInput').addEventListener('change', function () { getDelaySeconds(); saveDelay(); });
+document.querySelectorAll('.delay-presets button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    $('delayInput').value = b.getAttribute('data-delay');
+    getDelaySeconds();
+    saveDelay();
+  });
+});
+restoreDelay();
 $('fileInput').addEventListener('change', function () {
   previewNumbers = [];
   $('previewCounts').innerHTML = '';

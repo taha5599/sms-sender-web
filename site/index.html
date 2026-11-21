@@ -58,15 +58,14 @@
     <textarea id="messageInput" rows="4" placeholder="اكتب نص الرسالة هنا…"></textarea>
     <div class="row">
       <label>الفاصل بين الرسائل:
-        <select id="delaySelect">
-          <option value="2">ثانيتان</option>
-          <option value="3">3 ثوانٍ</option>
-          <option value="5" selected>5 ثوانٍ</option>
-          <option value="10">10 ثوانٍ</option>
-          <option value="15">15 ثانية</option>
-          <option value="20">20 ثانية</option>
-          <option value="30">30 ثانية</option>
-        </select>
+        <input type="number" id="delayInput" min="2" step="1" value="5" inputmode="numeric"> ثانية
+        <span class="delay-presets">
+          <button type="button" data-delay="2">2</button>
+          <button type="button" data-delay="5">5</button>
+          <button type="button" data-delay="10">10</button>
+          <button type="button" data-delay="30">30</button>
+          <button type="button" data-delay="60">60</button>
+        </span>
       </label>
       <span id="charCount" class="hint"></span>
     </div>

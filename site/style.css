@@ -257,3 +257,16 @@ tbody tr:last-child td { border-bottom: none; }
 footer { color: #5e554a; font-size: 13px; margin-top: 32px; }
 footer p { margin: 8px 0; }
 footer strong { color: #1f1b16; font-weight: 500; }
+
+/* (R76) delay input + presets — same treatment as other inputs/buttons. */
+input[type="number"] {
+  font: inherit;
+  padding: 8px 12px;
+  border: 1px solid rgba(31, 27, 22, 0.16);
+  border-radius: 8px;
+  background: #ffffff;
+  width: 84px;
+  font-variant-numeric: tabular-nums;
+}
+.delay-presets { display: inline-flex; gap: 6px; margin-inline-start: 8px; }
+.delay-presets button { padding: 4px 12px; font-size: 14px; }
