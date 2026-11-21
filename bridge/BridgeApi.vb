@@ -405,7 +405,10 @@ Public Module BridgeApi
             If Integer.TryParse(delayText, d) Then delaySeconds = d
         End If
         If delaySeconds < 2 Then delaySeconds = 2
-        If delaySeconds > 30 Then delaySeconds = 30
+        ' (R76b) No product cap anymore: the user types any delay. 86400
+        ' (24h) is only the overflow guard — DelaySeconds * 1000 must fit
+        ' in an Integer for SleepDelay.
+        If delaySeconds > 86400 Then delaySeconds = 86400
         Dim portsText As String = Nothing
         mp.Fields.TryGetValue("ports", portsText)
         Dim requested As List(Of String) = Nothing
