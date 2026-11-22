@@ -270,3 +270,19 @@ input[type="number"] {
 }
 .delay-presets { display: inline-flex; gap: 6px; margin-inline-start: 8px; }
 .delay-presets button { padding: 4px 12px; font-size: 14px; }
+
+/* (R77) bridge address input — same treatment as other inputs, wider for a URL. */
+input[type="text"]#bridgeAddressInput {
+  font: inherit;
+  padding: 8px 12px;
+  border: 1px solid rgba(31, 27, 22, 0.16);
+  border-radius: 8px;
+  background: #ffffff;
+  width: 340px;
+  max-width: 100%;
+  font-family: var(--mono);
+  font-size: 14px;
+}
+
+/* (R78) C-77-L1: mixed-content warning - amber like the excluded tag. */
+.warn { color: #8a6d1b; background: #fdf6e0; border: 1px solid rgba(201, 162, 39, 0.4); border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 8px 0; }

@@ -5,12 +5,119 @@
    bridge on the user's own PC (http://127.0.0.1:18711). Render never
    sees them. If this page is served BY the bridge itself, calls are
    same-origin (BRIDGE = ''); otherwise the page calls 127.0.0.1.
+   (R77) The bridge address is configurable on the page and saved in
+   localStorage, so the page can reach a bridge on another machine
+   (a LAN address or a tunnel URL) instead of this PC.
    Every /api/* call carries the X-SmsBridge header, which a cross-site
    form post cannot set — that is what keeps other websites from
    driving the modem. */
 
-var BRIDGE = (location.hostname === '127.0.0.1' || location.hostname === 'localhost')
-  ? '' : 'http://127.0.0.1:18711';
+/* (R77) bridge address: the page can point at a bridge on another
+   machine (a LAN address or a tunnel URL) instead of this PC. The
+   address is saved in localStorage (BRIDGE_KEY) and restored on the
+   next visit; empty means the old default - same-origin when this page
+   is served by the bridge itself, otherwise http://127.0.0.1:18711.
+   Every fetch reads the address fresh, so changing it takes effect
+   on the next call. */
+var BRIDGE_KEY = 'smsSenderBridge';
+var BRIDGE_DEFAULT = 'http://127.0.0.1:18711';
+/* (R78) Normalise a typed/saved bridge address to a bare origin:
+   trim, prepend http:// when there is no scheme (R78 M2 - a bare
+   host:port would otherwise fetch as a relative URL against the page
+   origin), then keep only the origin (R78 M1 - a saved path would
+   misroute every call to /path/api/...). (R79) Only http(s) schemes
+   are usable by fetch - any other scheme returns '' so the caller
+   falls back to the default. (R79) A bare host typed without a
+   scheme and without a port gets the bridge port 18711; a value that
+   already carried a scheme never gets a port appended. (R80) The
+   18711 append applies only to a LOCAL bridge address (IP literal,
+   localhost, a single-label LAN hostname or a .local name) - a bare
+   public hostname keeps its default port, so a tunnel host typed
+   without a scheme still works. (R80) A dangling colon with no port
+   digits (e.g. 192.168.1.50:) counts as NO port. Returns ''
+   when the value is empty or unparseable, so the caller falls back
+   to the default. */
+function normaliseBridgeAddress(raw) {
+  var v = String(raw == null ? '' : raw).trim();
+  if (!v) return '';
+  var hadScheme = v.indexOf('://') !== -1;
+  if (!hadScheme) v = 'http://' + v;
+  var u;
+  try { u = new URL(v); } catch (e) { return ''; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  if (!hadScheme && !rawHasPort(raw) && isLocalBridgeHost(u.hostname)) u.port = '18711';
+  return u.origin;
+}
+/* (R79) True when the raw (scheme-less) value already carries a port:
+   a ':' in the authority after any userinfo, or after ']' for IPv6.
+   (R80) A colon counts only when digits follow it: a dangling colon
+   (e.g. 192.168.1.50:) is NOT a port, so the bridge port is appended. */
+function rawHasPort(raw) {
+  var auth = String(raw).trim();
+  var cut = auth.search(/[\/?#]/);
+  if (cut !== -1) auth = auth.slice(0, cut);
+  var at = auth.lastIndexOf('@');
+  if (at !== -1) auth = auth.slice(at + 1);
+  if (auth.charAt(0) === '[') {
+    var close = auth.indexOf(']');
+    if (close === -1) return false;
+    return /^:\d/.test(auth.slice(close + 1));
+  }
+  return /:\d/.test(auth);
+}
+/* (R80) True when the parsed hostname is a LOCAL bridge address: an IP
+   literal (v4/v6), localhost, a single-label LAN hostname, or a .local
+   (mDNS) name. A bare public hostname (e.g. a tunnel host typed without
+   a scheme) is NOT local, so it keeps its default port. (R81) Trailing
+   dots are stripped first: the fully-qualified root form (mypc.,
+   mybridge.local.) is local too, not just localhost. */
+function isLocalBridgeHost(h) {
+  h = String(h || '').toLowerCase().replace(/\.+$/, '');
+  if (h === 'localhost') return true;
+  if (h.charAt(0) === '[' && h.charAt(h.length - 1) === ']') return true;
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(h)) return true;
+  if (h.indexOf('.') === -1) return true;
+  return h.slice(-6) === '.local';
+}
+function getBridgeBase() {
+  var saved = '';
+  try { saved = localStorage.getItem(BRIDGE_KEY) || ''; } catch (e) { /* storage unavailable */ }
+  var base = normaliseBridgeAddress(saved);
+  if (base) return base;
+  return (location.hostname === '127.0.0.1' || location.hostname === 'localhost')
+    ? '' : BRIDGE_DEFAULT;
+}
+/* (R78) The stored value is always the normalised origin (or ''), so
+   what is saved, what is fetched and what is displayed agree. */
+function saveBridgeAddress() {
+  try { localStorage.setItem(BRIDGE_KEY, normaliseBridgeAddress($('bridgeAddressInput').value)); } catch (e) { /* storage unavailable */ }
+}
+/* (R78) The input shows the EFFECTIVE base: the normalised origin, or
+   the page's own origin on the bridge-served page, where the effective
+   base is '' (same-origin) - never a stale raw value or the 127.0.0.1
+   default while the page is served from localhost. */
+function displayBridgeBase() {
+  var base = getBridgeBase();
+  return base || location.origin;
+}
+function restoreBridgeAddress() {
+  $('bridgeAddressInput').value = displayBridgeBase();
+}
+/* (R78) Mixed content: from an https page the browser blocks fetches to
+   an http:// public host (only loopback is exempt), so warn visibly
+   instead of failing silently as "الوسيط لا يعمل". */
+function isBridgeMixedContent() {
+  if (location.protocol !== 'https:') return false;
+  var base = getBridgeBase();
+  if (!base || base.indexOf('http://') !== 0) return false;
+  var host = '';
+  try { host = new URL(base).hostname; } catch (e) { return false; }
+  return host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]' && host !== '::1';
+}
+function updateBridgeWarning() {
+  var el = $('bridgeMixedWarning');
+  if (el) el.classList.toggle('hidden', !isBridgeMixedContent());
+}
 var BRIDGE_HEADER = 'X-SmsBridge';
 var BRIDGE_TOKEN = 'sms-web-1.0';
 
@@ -36,7 +143,7 @@ function api(path, opts) {
   if (opts.headers) {
     for (var k in opts.headers) headers[k] = opts.headers[k];
   }
-  return fetch(BRIDGE + path, {
+  return fetch(getBridgeBase() + path, {
     method: opts.method || 'GET',
     headers: headers,
     body: opts.body || undefined
@@ -433,5 +540,11 @@ $('fileInput').addEventListener('change', function () {
   $('btnPreview').disabled = !selectedFile();
   updateSendButton();
 });
+
+$('bridgeAddressInput').addEventListener('input', saveBridgeAddress);
+$('bridgeAddressInput').addEventListener('input', updateBridgeWarning);
+$('bridgeAddressInput').addEventListener('change', function () { saveBridgeAddress(); restoreBridgeAddress(); updateBridgeWarning(); checkBridge(true); });
+restoreBridgeAddress();
+updateBridgeWarning();
 
 checkBridge(true);
