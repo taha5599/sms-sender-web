@@ -28,8 +28,12 @@ Public Class JobRow
     Public Property Port As String = String.Empty
     Public Property Ok As Boolean
     ''' <summary>(Round 61) C-60-M1/A-60-L1: True for a row that was never attempted because the job was stopped -
-    ''' it counts in the cancelled bucket, not in failed, so sent+failed+cancelled = total.</summary>
+    ''' it counts in the cancelled bucket, not in failed, so sent+failed+cancelled+unconfirmed = total.</summary>
     Public Property Cancelled As Boolean
+    ''' <summary>(Round 80P) P2: True when the send ended unconfirmed (Ctrl-Z out, OK, no +CMGS:) -
+    ''' the row counts in the unconfirmed bucket, never in sent and never in failed, so
+    ''' sent+failed+cancelled+unconfirmed = total.</summary>
+    Public Property Unconfirmed As Boolean
     Public Property Message As String = String.Empty
     Public Property SegmentsSent As Integer
     Public Property SegmentsTotal As Integer
@@ -171,6 +175,8 @@ Public Class ModemWorker
                         pending -= credit
                         If r.SegmentsSent >= r.SegmentsTotal Then
                             r.Success = True
+                            ' (Round 80P) P2: fully credited late - the row is confirmed now, not unconfirmed.
+                            r.Unconfirmed = False
                             r.Message = "تم (تأكيد متأخر)" & If(pw OrElse r.Message.Contains("(بدون تأكيد OK)"), " (بدون تأكيد OK)", String.Empty)
                         End If
                     End If
@@ -187,7 +193,7 @@ Public Class ModemWorker
                             deadReason = "انقطع الاتصال بالمودم " & Port & " أثناء الإرسال"
                         End If
                     End If
-                    Dim row As New JobRow() With {.Number = number, .Port = Port, .Ok = r.Success, .Message = r.Message, .SegmentsSent = r.SegmentsSent, .SegmentsTotal = r.SegmentsTotal}
+                    Dim row As New JobRow() With {.Number = number, .Port = Port, .Ok = r.Success, .Unconfirmed = r.Unconfirmed, .Message = r.Message, .SegmentsSent = r.SegmentsSent, .SegmentsTotal = r.SegmentsTotal}
                     Job.RecordResult(row)
                     If r.Success Then
                         Job.AddLog("✓ " & number & " (" & Port & ")")
@@ -224,6 +230,8 @@ Public Class SendJob
     Private _results As New List(Of JobRow)()
     Private _sent As Integer
     Private _failed As Integer
+    ''' <summary>(Round 80P) P2: rows that ended unconfirmed - counted separately, never sent, never failed.</summary>
+    Private _unconfirmed As Integer
     ''' <summary>(Round 61) C-60-M1/A-60-L1: rows never attempted because the job was stopped.</summary>
     Private _cancelled As Integer
     Private _logLines As New List(Of String)()
@@ -269,7 +277,14 @@ Public Class SendJob
     Public Sub RecordResult(row As JobRow)
         SyncLock _stateLock
             _results.Add(row)
-            If row.Ok Then _sent += 1 Else _failed += 1
+            ' (Round 80P) P2: an unconfirmed row is its own bucket - never sent, never failed.
+            If row.Ok Then
+                _sent += 1
+            ElseIf row.Unconfirmed Then
+                _unconfirmed += 1
+            Else
+                _failed += 1
+            End If
         End SyncLock
     End Sub
 
@@ -279,7 +294,14 @@ Public Class SendJob
                 row.Ok = True
                 row.Message = newMessage
                 _sent += 1
-                _failed -= 1
+                ' (Round 80P) P2: the row leaves the bucket it was counted in - an unconfirmed row
+                ' leaves _unconfirmed, a definite failure leaves _failed.
+                If row.Unconfirmed Then
+                    row.Unconfirmed = False
+                    _unconfirmed -= 1
+                Else
+                    _failed -= 1
+                End If
             End If
         End SyncLock
     End Sub
@@ -293,6 +315,28 @@ Public Class SendJob
     Public Function FailedCount() As Integer
         SyncLock _stateLock
             Return _failed
+        End SyncLock
+    End Function
+
+    ''' <summary>(Round 80P) P2: how many rows ended unconfirmed.</summary>
+    Public Function UnconfirmedCount() As Integer
+        SyncLock _stateLock
+            Return _unconfirmed
+        End SyncLock
+    End Function
+
+    ''' <summary>(Round 81P) Q: rows that ended unconfirmed AFTER sending at least one segment -
+    ''' re-sending them duplicates the confirmed segments, so the summary carries the desktop
+    ''' partial sub-clause (Fix78). Counted from the rows, like the per-modem counts, so it
+    ''' can never drift from the buckets: a late credit that flips a row to sent clears
+    ''' Unconfirmed first, and a partial credit leaves SegmentsSent > 0 with Unconfirmed set.</summary>
+    Public Function UnconfirmedPartialCount() As Integer
+        SyncLock _stateLock
+            Dim n As Integer = 0
+            For Each r As JobRow In _results
+                If r.Unconfirmed AndAlso r.SegmentsSent > 0 Then n += 1
+            Next
+            Return n
         End SyncLock
     End Function
 
@@ -321,7 +365,7 @@ Public Class SendJob
             If StopRequested() Then
                 ' (Round 61) C-60-M1/A-60-L1: a stop used to leave every unattempted number without a row
                 ' (sent+failed ended below total, results missing rows). Every unattempted number gets a
-                ' stopped row instead, so sent+failed+cancelled = total.
+                ' stopped row instead, so sent+failed+cancelled+unconfirmed = total.
                 RecordStoppedRows()
             Else
                 CollectRetryFromDeadWorkers()
@@ -377,12 +421,15 @@ Public Class SendJob
             End SyncLock
             Dim doneLine As String = "اكتمل الإرسال: نجح " & SentCount() & "، فشل " & FailedCount() & " (من " & Numbers.Count & ")"
             If CancelledCount() > 0 Then doneLine &= "، أُوقف " & CancelledCount()
+            If UnconfirmedCount() > 0 Then doneLine &= "، لم يتم تأكيد " & UnconfirmedCount() & " (قد تكون أُرسلت — تحقق قبل إعادة الإرسال)"
+            Dim uncPartial As Integer = UnconfirmedPartialCount()
+            If uncPartial > 0 Then doneLine &= " (منها " & uncPartial & " أُرسلت مقاطع قبل عدم التأكيد — إعادة الإرسال ستعيد إرسال المقاطع التي تم إرسالها)"
             AddLog(doneLine)
         End Try
     End Sub
 
     ''' <summary>(Round 61) C-60-M1/A-60-L1: records every number the job never attempted as a stopped row, so
-    ''' sent+failed+cancelled = total and no number vanishes from the results. Runs only on the coordinator thread
+    ''' sent+failed+cancelled+unconfirmed = total and no number vanishes from the results. Runs only on the coordinator thread
     ''' after all workers joined, so QueueIndex is stable. A worker's remaining numbers are recorded once: workers
     ''' already collected into the retry list are skipped (their numbers live in the retry workers' queues or in
     ''' _retryNumbers, both drained here too).</summary>
@@ -449,7 +496,7 @@ Public Class SendJob
         Dim resultsCopy As List(Of JobRow)
         Dim logCopy As List(Of String)
         Dim workersCopy As List(Of ModemWorker)
-        Dim sent As Integer, failed As Integer, cancelled As Integer
+        Dim sent As Integer, failed As Integer, cancelled As Integer, unconfirmed As Integer
         Dim doneVal As Boolean, stoppedVal As Boolean
         Dim fatalVal As String = String.Empty
         SyncLock _stateLock
@@ -459,6 +506,7 @@ Public Class SendJob
             sent = _sent
             failed = _failed
             cancelled = _cancelled
+            unconfirmed = _unconfirmed
             ' (Round 61) B-60-L1: Done/Stopped/FatalError are read under the same lock the coordinator writes them
             ' under, so a snapshot never mixes values from two moments.
             doneVal = Done
@@ -472,6 +520,14 @@ Public Class SendJob
         sb.Append("""sent"":").Append(sent).Append(",")
         sb.Append("""failed"":").Append(failed).Append(",")
         sb.Append("""cancelled"":").Append(cancelled).Append(",")
+        sb.Append("""unconfirmed"":").Append(unconfirmed).Append(",")
+        ' (Round 81P) Q: unconfirmed-partial sub-count for the totals line (desktop Fix78) -
+        ' rows unconfirmed after sending >= 1 segment. Counted from the snapshot copy.
+        Dim unconfirmedPartial As Integer = 0
+        For Each r As JobRow In resultsCopy
+            If r.Unconfirmed AndAlso r.SegmentsSent > 0 Then unconfirmedPartial += 1
+        Next
+        sb.Append("""unconfirmedPartial"":").Append(unconfirmedPartial).Append(",")
         sb.Append("""done"":").Append(JsonBool(doneVal)).Append(",")
         sb.Append("""stopped"":").Append(JsonBool(stoppedVal)).Append(",")
         sb.Append("""fatalError"":").Append(JsonStr(fatalVal)).Append(",")
@@ -501,7 +557,7 @@ Public Class SendJob
             Dim w As MergedModem = merged(portKey)
             If Not first Then sb.Append(",")
             first = False
-            Dim wSent As Integer = 0, wFailed As Integer = 0, wCancelled As Integer = 0
+            Dim wSent As Integer = 0, wFailed As Integer = 0, wCancelled As Integer = 0, wUnconfirmed As Integer = 0
             For Each r As JobRow In resultsCopy
                 If String.Equals(r.Port, w.Port, StringComparison.OrdinalIgnoreCase) Then
                     ' (Round 62) B-61-L1: a stopped row is cancelled, not failed - counting every non-Ok row as
@@ -511,6 +567,8 @@ Public Class SendJob
                         wSent += 1
                     ElseIf r.Cancelled Then
                         wCancelled += 1
+                    ElseIf r.Unconfirmed Then
+                        wUnconfirmed += 1
                     Else
                         wFailed += 1
                     End If
@@ -521,6 +579,7 @@ Public Class SendJob
             sb.Append("""sent"":").Append(wSent).Append(",")
             sb.Append("""failed"":").Append(wFailed).Append(",")
             sb.Append("""cancelled"":").Append(wCancelled).Append(",")
+            sb.Append("""unconfirmed"":").Append(wUnconfirmed).Append(",")
             sb.Append("""status"":").Append(JsonStr(w.Status)).Append(",")
             sb.Append("""current"":").Append(JsonStr(w.Current)).Append(",")
             sb.Append("""reason"":").Append(JsonStr(w.Reason))
@@ -529,7 +588,7 @@ Public Class SendJob
         For Each e As ExcludedPort In Excluded
             If Not first Then sb.Append(",")
             first = False
-            sb.Append("{""port"":").Append(JsonStr(e.Port)).Append(",""sent"":0,""failed"":0,""cancelled"":0,""status"":""excluded"",""current"":"""",""reason"":").Append(JsonStr(e.Reason)).Append("}")
+            sb.Append("{""port"":").Append(JsonStr(e.Port)).Append(",""sent"":0,""failed"":0,""cancelled"":0,""unconfirmed"":0,""status"":""excluded"",""current"":"""",""reason"":").Append(JsonStr(e.Reason)).Append("}")
         Next
         sb.Append("],""log"":[")
         first = True
@@ -548,6 +607,7 @@ Public Class SendJob
             sb.Append("""port"":").Append(JsonStr(r.Port)).Append(",")
             sb.Append("""ok"":").Append(JsonBool(r.Ok)).Append(",")
             sb.Append("""cancelled"":").Append(JsonBool(r.Cancelled)).Append(",")
+            sb.Append("""unconfirmed"":").Append(JsonBool(r.Unconfirmed)).Append(",")
             sb.Append("""message"":").Append(JsonStr(r.Message)).Append(",")
             sb.Append("""segmentsSent"":").Append(r.SegmentsSent).Append(",")
             sb.Append("""segmentsTotal"":").Append(r.SegmentsTotal)

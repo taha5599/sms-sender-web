@@ -94,6 +94,84 @@ Public Module BridgeApi
         End SyncLock
     End Sub
 
+
+    ' (R75W) Read-only inbox: a fresh AT+CMGL=4 read on every call, nothing cached, nothing deleted/marked read.
+    ' (Round 76W) D2/B-L1: the inbox read claims the single send slot for its whole duration (probe + open +
+    ' CMGL), so a concurrent send gets an honest 409 instead of failing 400 on a port this read holds. The
+    ' claim is released in Finally on every return, as ApiSend does (Round 62). TryClaimSendSlot also refuses
+    ' while a send job is active, so it subsumes the old HasActiveJob check.
+    Public Function ApiInbox(req As BridgeMain.HttpRequest) As BridgeMain.HttpResponse
+        If Not TryClaimSendSlot() Then
+            Return ErrorResponse(409, "يوجد إرسال أو قراءة وارد جارية — أعد المحاولة بعد انتهائها")
+        End If
+        Try
+            Return ApiInboxCore(req)
+        Finally
+            ReleaseSendSlot()
+        End Try
+    End Function
+
+    Private Function ApiInboxCore(req As BridgeMain.HttpRequest) As BridgeMain.HttpResponse
+        Dim portName As String = req.QueryValue("port")
+        Dim requested As List(Of String) = Nothing
+        If Not String.IsNullOrEmpty(portName) Then
+            requested = New List(Of String)()
+            requested.Add(portName.Trim())
+        End If
+        Dim outcome As ProbeOutcome = ProbePorts(requested)
+        Dim target As ModemSender.PortInfo = Nothing
+        Try
+            target = ModemSender.ChooseProbedPort(outcome.Results)
+        Catch ex As Exception
+            BridgeMain.Log("choose inbox port error: " & ex.Message)
+        End Try
+        If target Is Nothing AndAlso outcome.Usable.Count > 0 Then target = outcome.Usable(0)
+        If target Is Nothing Then
+            If requested IsNot Nothing AndAlso outcome.Excluded.Count > 0 Then
+                Return ErrorResponse(400, "المنفذ " & portName & " غير متاح — " & outcome.Excluded(0).Reason)
+            End If
+            Dim errText As String = If(outcome.TimedOut, "تعذر تعداد المنافذ: " & outcome.WmiError, "لا يوجد مودم سليم")
+            Return ErrorResponse(400, errText)
+        End If
+        Dim messages As List(Of ModemSender.InboxMessage) = Nothing
+        Dim inboxError As String = String.Empty
+        Try
+            Using modem As New ModemSender()
+                Dim openOk As Boolean = False
+                Try
+                    openOk = modem.Open(target.PortName, Nothing)
+                Catch ex As Exception
+                    Return ErrorResponse(500, "تعذر فتح المنفذ " & target.PortName & ": " & ex.Message)
+                End Try
+                If Not openOk Then
+                    Return ErrorResponse(500, "فشل فتح المنفذ " & target.PortName & " (المودم لم يرد على أوامر AT/ATE0)")
+                End If
+                messages = modem.ReadInboxSms(inboxError, Nothing)
+            End Using
+        Catch ex As Exception
+            Return ErrorResponse(500, "خطأ أثناء قراءة الوارد: " & ex.Message)
+        End Try
+        If messages Is Nothing Then
+            Return ErrorResponse(500, inboxError)
+        End If
+        Dim sb As New StringBuilder()
+        sb.Append("{""ok"":true,""port"":").Append(JsonStr(target.PortName)).Append(",""messages"":[")
+        Dim first As Boolean = True
+        For Each m As ModemSender.InboxMessage In messages
+            If Not first Then sb.Append(",")
+            first = False
+            sb.Append("{")
+            sb.Append("""index"":").Append(m.Index).Append(",")
+            sb.Append("""status"":").Append(JsonStr(m.Status)).Append(",")
+            sb.Append("""from"":").Append(JsonStr(m.FromNumber)).Append(",")
+            sb.Append("""time"":").Append(JsonStr(m.TimeText)).Append(",")
+            sb.Append("""text"":").Append(JsonStr(m.Text))
+            sb.Append("}")
+        Next
+        sb.Append("]}")
+        Return JsonResponse(200, sb.ToString())
+    End Function
+
     Public Function ApiStatus(req As BridgeMain.HttpRequest) As BridgeMain.HttpResponse
         Return JsonResponse(200, "{""ok"":true,""version"":" & JsonStr(BridgeMain.BridgeVersion) & ",""bridge"":""SmsSenderBridge""}")
     End Function
@@ -390,7 +468,7 @@ Public Module BridgeApi
         ' ApiSend (Round 62) B-61-H1/C-61-H1; once registered, HasActiveJob guards the running job. (The whole body
         ' below runs inside this Try, so its indentation is one level shallower than the Try - cosmetic only.)
         If Not TryClaimSendSlot() Then
-            Return ErrorResponse(409, "يوجد إرسال جارٍ — انتظر حتى ينتهي أو أوقفه")
+            Return ErrorResponse(409, "يوجد إرسال أو قراءة وارد جارية — أعد المحاولة بعد انتهائها")
         End If
         Try
         Dim message As String = Nothing

@@ -45,6 +45,17 @@ Public Class ModemSender
         ''' failures (CMS ERROR, timeout, no credit) — those leave
         ''' the modem usable.</summary>
         Public Property PortDead As Boolean
+        ''' <summary>(Round 75) LIVE 2026-11-23: True when Ctrl-Z
+        ''' went out and the terminal reply was OK but no +CMGS:
+        ''' arrived in the wait + grace + drain windows — the
+        ''' segment MAY have been sent; its fate is UNKNOWN. Never
+        ''' counted as sent (SegmentsSent stays 0 for it) and never
+        ''' reported as a definite failure: the caller counts it
+        ''' separately as unconfirmed, and a late +CMGS: credited
+        ''' later clears it (see CreditPrevRowLateConfirmations).
+        ''' False for ordinary failures (CMS ERROR, timeout with
+        ''' no reply, prompt failure) — those are known-not-sent.</summary>
+        Public Property Unconfirmed As Boolean
     End Class
 
     Public Class PortInfo
@@ -533,6 +544,25 @@ Public Class ModemSender
     ' (VB has no Volatile field modifier, so Lazy(Of T) is used.)
     Private Shared ReadOnly _gsmDefaultMapLazy As New Lazy(Of Dictionary(Of Char, Integer))(AddressOf BuildGsmDefaultMap)
     Private Shared ReadOnly _gsmExtMapLazy As New Lazy(Of Dictionary(Of Char, Integer))(AddressOf BuildGsmExtensionMap)
+    ' (R75W) Reverse maps for the inbox PDU decoder (septet -> character).
+    Private Shared ReadOnly _gsmDefaultRevLazy As New Lazy(Of Dictionary(Of Integer, Char))(AddressOf BuildGsmDefaultRevMap)
+    Private Shared ReadOnly _gsmExtRevLazy As New Lazy(Of Dictionary(Of Integer, Char))(AddressOf BuildGsmExtRevMap)
+
+    Private Shared Function BuildGsmDefaultRevMap() As Dictionary(Of Integer, Char)
+        Dim rev As New Dictionary(Of Integer, Char)()
+        For Each kv As KeyValuePair(Of Char, Integer) In GsmDefaultMap()
+            If Not rev.ContainsKey(kv.Value) Then rev.Add(kv.Value, kv.Key)
+        Next
+        Return rev
+    End Function
+
+    Private Shared Function BuildGsmExtRevMap() As Dictionary(Of Integer, Char)
+        Dim rev As New Dictionary(Of Integer, Char)()
+        For Each kv As KeyValuePair(Of Char, Integer) In GsmExtensionMap()
+            If Not rev.ContainsKey(kv.Value) Then rev.Add(kv.Value, kv.Key)
+        Next
+        Return rev
+    End Function
 
     Public ReadOnly Property IsOpen As Boolean
         Get
@@ -1324,7 +1354,9 @@ Public Class ModemSender
     End Function
 
     ''' <summary>(Round 57) C-55-L2: the final-result lines
-    ''' (ERROR / +CMS ERROR / +CME ERROR) found in a drained text,
+    ''' (ERROR / +CMS ERROR / +CME ERROR, plus — Round 77 — the
+    ''' other non-OK final codes NO CARRIER / NO DIALTONE / BUSY /
+    ''' NO ANSWER) found in a drained text,
     ''' joined with vbCrLf — NOT spaces — so BuildTimeoutReply can
     ''' split and dedupe them per line (Round 59 B-57-L1: a space
     ''' join fused two distinct lines into one pseudo-line and the
@@ -1335,7 +1367,16 @@ Public Class ModemSender
     ''' (Round 59 C-57-L1) keeps only +CMS ERROR / +CME ERROR
     ''' lines: plain AT is never answered with a CMGS-family
     ''' error, so those can only be the submit's late answer,
-    ''' while a bare ERROR answers the probe itself.</summary>
+    ''' while a bare ERROR answers the probe itself.
+    ''' (Round 77) R76-A-L2/D-O1: a BUSY / NO CARRIER arriving only
+    ''' in the drain was invisible — the predicate and the suffix
+    ''' never saw it, so a definite refusal counted as unconfirmed.
+    ''' These codes are mined exactly like the error lines (plain
+    ''' AT is never answered with them, so they can only be the
+    ''' submit's late answer, probe window included). OK is never
+    ''' mined here — the caller mines a drain OK separately, from
+    ''' the late drain only, so the probe's OK can never leak in —
+    ''' and +CMGS: never is either (CountGuardedCmgs owns it).</summary>
     Private Shared Function DrainFinalResultLines(text As String, Optional includeBareError As Boolean = True) As String
         If String.IsNullOrEmpty(text) Then Return String.Empty
         Dim found As New List(Of String)()
@@ -1344,7 +1385,22 @@ Public Class ModemSender
             Dim isCmsOrCme As Boolean = t.StartsWith("+CMS ERROR", StringComparison.OrdinalIgnoreCase) _
                 OrElse t.StartsWith("+CME ERROR", StringComparison.OrdinalIgnoreCase)
             Dim isBareError As Boolean = t.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase)
-            If isCmsOrCme OrElse (includeBareError AndAlso isBareError) Then
+            ' (Round 77) R76-A-L2/D-O1: a non-OK final-result line
+            ' other than +CMGS: and the error family is a definite
+            ' refusal too — mine it, so it reaches the predicate
+            ' and the suffix. The exclusions reuse the file's own
+            ' line classifiers, so no new unresolvable name is
+            ' introduced: OK stays out (ReplyHasTerminalOk on the
+            ' single line — the caller mines a drain OK separately,
+            ' late drain only), +CMGS: stays out (CountGuardedCmgs
+            ' owns it), and the error lines stay behind the
+            ' includeBareError gate (a bare ERROR can answer the
+            ' probe itself).
+            Dim isNonOkFinal As Boolean = IsFinalResultLineText(t) _
+                AndAlso Not ReplyHasTerminalOk(t) _
+                AndAlso Not LineStartsWith(t, "+CMGS:") _
+                AndAlso Not isCmsOrCme AndAlso Not isBareError
+            If isCmsOrCme OrElse (includeBareError AndAlso isBareError) OrElse isNonOkFinal Then
                 ' (Round 58) C-56-L2: the same final-result line can
                 ' arrive several times in one drain window — keep it
                 ' once (different lines are all kept).
@@ -1354,17 +1410,22 @@ Public Class ModemSender
         Return String.Join(vbCrLf, found)
     End Function
 
-    ''' <summary>(Round 58) C-56-L2: flattens the three timeout-reply
-    ''' sources (initial reply, grace read, drain final lines) into
-    ''' one space-separated string with identical lines shown once:
-    ''' the same +CMS ERROR can arrive in both the grace window and
-    ''' the drain window, and repeating it wastes the 200-char
-    ''' window. First occurrence wins, order kept; empty lines
-    ''' dropped. The 200-char cap stays at the call site.</summary>
-    Friend Shared Function BuildTimeoutReply(response As String, graceText As String, drainFinal As String) As String
+    ''' <summary>(Round 58) C-56-L2: flattens the timeout-reply
+    ''' sources (initial reply, grace read, drain final lines, and
+    ''' — Round 77 — the raw drain text) into one space-separated
+    ''' string with identical lines shown once: the same +CMS ERROR
+    ''' can arrive in both the grace window and the drain window,
+    ''' and repeating it wastes the 200-char window. First
+    ''' occurrence wins, order kept; empty lines dropped. The
+    ''' 200-char cap stays at the call site. The raw drain text is
+    ''' a source because its unsolicited lines (BOOT:/^RSSI:) are
+    ''' mined by nothing else — without it the suffix wrongly said
+    ''' "لا يوجد رد" when the drain held bytes. The probe text is
+    ''' deliberately NOT a source: its OK answers the probe.</summary>
+    Friend Shared Function BuildTimeoutReply(response As String, graceText As String, drainFinal As String, Optional drainRaw As String = "") As String
         Dim seen As New System.Collections.Generic.HashSet(Of String)(StringComparer.Ordinal)
         Dim parts As New System.Collections.Generic.List(Of String)()
-        For Each source As String In New String() {response, graceText, drainFinal}
+        For Each source As String In New String() {response, graceText, drainFinal, drainRaw}
             If String.IsNullOrEmpty(source) Then Continue For
             For Each line As String In SplitLines(source)
                 Dim t As String = line.Trim()
@@ -1420,6 +1481,31 @@ Public Class ModemSender
             If LineTextMatchesExpected(line.Trim(), expected) Then Return True
         Next
         Return False
+    End Function
+
+    ''' <summary>(Round 75) LIVE 2026-11-23: True when a reply
+    ''' holds a terminal OK line — a line that is exactly "OK"
+    ''' after trim. "OKAY" must not match (exact-line rule, not
+    ''' the word-boundary rule of LineMatchesExpected): only a
+    ''' bare OK proves the modem answered in command mode.</summary>
+    Friend Shared Function ReplyHasTerminalOk(text As String) As Boolean
+        If String.IsNullOrEmpty(text) Then Return False
+        For Each line As String In SplitLines(text)
+            If line.Trim().Equals("OK", StringComparison.OrdinalIgnoreCase) Then Return True
+        Next
+        Return False
+    End Function
+
+    ''' <summary>(Round 75) LIVE 2026-11-23: True when a reply
+    ''' holds a terminal error line — a line starting with ERROR,
+    ''' +CMS ERROR or +CME ERROR (line-anchored like
+    ''' LineStartsWith: message text echoed back must never
+    ''' count). An error anywhere beats an OK anywhere: a
+    ''' refusal is known-not-sent, an OK beside it changes
+    ''' nothing.</summary>
+    Friend Shared Function ReplyHasTerminalError(text As String) As Boolean
+        If String.IsNullOrEmpty(text) Then Return False
+        Return LineStartsWith(text, "ERROR") OrElse LineStartsWith(text, "+CMS ERROR") OrElse LineStartsWith(text, "+CME ERROR")
     End Function
 
     ''' <summary>True when a reply line is exactly "&gt;" after trim.</summary>
@@ -3698,6 +3784,332 @@ Public Class ModemSender
         Return signalText
     End Function
 
+    ' ------------------------------------------------------------------
+    ' Inbox (R75W): read received SMS from the SIM (AT+CMGL=4, PDU mode).
+    ' Read-only v1: no delete / mark-read. The PDU decode below is pure
+    ' logic (Shared, no SerialPort) so the sim pins it exactly; only
+    ' ReadInboxSms touches the port, via the same SendCommand path as
+    ' TestConnection/CheckSim/GetSignal.
+    ' ------------------------------------------------------------------
+
+    ''' <summary>One received SMS as listed by AT+CMGL=4.</summary>
+    Public Class InboxMessage
+        Public Property Index As Integer
+        Public Property Status As String = String.Empty
+        Public Property FromNumber As String = String.Empty
+        Public Property TimeText As String = String.Empty
+        Public Property Text As String = String.Empty
+    End Class
+
+    Private Shared Function InboxStatusLabel(stat As Integer) As String
+        Select Case stat
+            Case 0
+                Return "غير مقروءة"
+            Case 1
+                Return "مقروءة"
+            Case 2
+                Return "غير مرسلة"
+            Case 3
+                Return "مرسلة"
+            Case Else
+                Return "؟"
+        End Select
+    End Function
+
+    ''' <summary>Hex string to bytes. Returns Nothing when the text is not even-length hex.</summary>
+    Private Shared Function HexToBytes(hex As String) As Byte()
+        If String.IsNullOrEmpty(hex) OrElse (hex.Length Mod 2) <> 0 Then Return Nothing
+        Dim bytes(hex.Length \ 2 - 1) As Byte
+        Try
+            For i As Integer = 0 To bytes.Length - 1
+                Dim hi As Integer = Convert.ToInt32(hex.Substring(i * 2, 1), 16)
+                Dim lo As Integer = Convert.ToInt32(hex.Substring(i * 2 + 1, 1), 16)
+                bytes(i) = CByte((hi << 4) Or lo)
+            Next
+        Catch ex As Exception
+            System.Diagnostics.Debug.WriteLine("HexToBytes failed: " & ex.Message)
+            Return Nothing
+        End Try
+        Return bytes
+    End Function
+
+    ''' <summary>One SCTS semi-octet byte as a BCD value (TS 23.040 9.2.3.11: low nibble = tens, high nibble = units).
+    ''' -1 when a nibble is not a digit.</summary>
+    Private Shared Function BcdSemiOctet(b As Integer) As Integer
+        Dim lo As Integer = b And &HF
+        Dim hi As Integer = (b >> 4) And &HF
+        If lo > 9 OrElse hi > 9 Then Return -1
+        Return lo * 10 + hi
+    End Function
+
+    ''' <summary>Swapped-BCD semi-octets to digits. A trailing &HF filler is dropped.</summary>
+    Private Shared Function SemiOctetsToDigits(data As Byte(), offset As Integer, digitCount As Integer) As String
+        Dim sb As New System.Text.StringBuilder()
+        Dim i As Integer = offset
+        While sb.Length < digitCount AndAlso i < data.Length
+            Dim lo As Integer = data(i) And &HF
+            sb.Append(ChrW(AscW("0"c) + lo))
+            If sb.Length >= digitCount Then Exit While
+            Dim hi As Integer = (data(i) >> 4) And &HF
+            If hi <> &HF Then sb.Append(ChrW(AscW("0"c) + hi))
+            i += 1
+        End While
+        Return sb.ToString()
+    End Function
+
+    ''' <summary>Unpacks GSM 7-bit septets from packed bytes starting at startBit, for septetCount septets.
+    ''' An unknown septet becomes U+FFFD (visible, never a silent '?'); 0x1B consumes the next septet from the
+    ''' extension table (an unknown extension septet also becomes U+FFFD).</summary>
+    Private Shared Function UnpackGsm7Bit(data As Byte(), startBit As Integer, septetCount As Integer) As String
+        Dim revDef As Dictionary(Of Integer, Char) = _gsmDefaultRevLazy.Value
+        Dim revExt As Dictionary(Of Integer, Char) = _gsmExtRevLazy.Value
+        Dim sb As New System.Text.StringBuilder()
+        Dim bitPos As Integer = startBit
+        Dim s As Integer = 0
+        While s < septetCount
+            Dim byteIndex As Integer = bitPos \ 8
+            If byteIndex >= data.Length Then Exit While
+            Dim bitOffset As Integer = bitPos Mod 8
+            Dim septet As Integer = (data(byteIndex) >> bitOffset) And &H7F
+            If bitOffset + 7 > 8 AndAlso byteIndex + 1 < data.Length Then
+                septet = septet Or ((data(byteIndex + 1) And ((1 << (bitOffset + 7 - 8)) - 1)) << (8 - bitOffset))
+            End If
+            bitPos += 7
+            s += 1
+            If septet = &H1B Then
+                ' Extension escape: the NEXT septet selects the character.
+                If s >= septetCount Then
+                    sb.Append(ChrW(&HFFFD))
+                    Exit While
+                End If
+                Dim b2 As Integer = bitPos \ 8
+                If b2 >= data.Length Then
+                    sb.Append(ChrW(&HFFFD))
+                    Exit While
+                End If
+                Dim o2 As Integer = bitPos Mod 8
+                Dim ext As Integer = (data(b2) >> o2) And &H7F
+                If o2 + 7 > 8 AndAlso b2 + 1 < data.Length Then
+                    ext = ext Or ((data(b2 + 1) And ((1 << (o2 + 7 - 8)) - 1)) << (8 - o2))
+                End If
+                bitPos += 7
+                s += 1
+                Dim extCh As Char = ChrW(0)
+                If revExt.TryGetValue(ext, extCh) Then sb.Append(extCh) Else sb.Append(ChrW(&HFFFD))
+            Else
+                Dim ch As Char = ChrW(0)
+                If revDef.TryGetValue(septet, ch) Then sb.Append(ch) Else sb.Append(ChrW(&HFFFD))
+            End If
+        End While
+        Return sb.ToString()
+    End Function
+
+    ''' <summary>Decodes one SMS-DELIVER PDU (hex, as listed by AT+CMGL=4) into an InboxMessage (without Index/Status,
+    ''' which come from the +CMGL: header line). Sender: semi-octet digits, '+' when the type is international (0x91),
+    ''' alphanumeric (type 0xD0) via GSM 7-bit. Timestamp: SCTS as "YYYY-MM-DD HH:mm:ss +HH:MM" (SCTS is the SMSC's
+    ''' local time; the timezone octet's bit 3 is the sign, per TS 23.040 9.2.3.11). Text: alphabet by DCS group (TS 23.038 4) -
+    ''' UCS2 when DCS bits 3-2 are 10 in groups 00xx/01xx, or group 1110; 8-bit data as Latin-1 when 01 in groups 00xx/01xx,
+    ''' or bit 2 set in group 1111; GSM 7-bit otherwise (incl. groups 1100/1101 and reserved 1000-1011); a UDH (first-octet
+    ''' bit 6) is skipped - octets for UCS2/8-bit, septets (fill bit included) for GSM 7-bit. Returns False (msg left empty)
+    ''' on any malformed/truncated PDU instead of guessing.</summary>
+    Public Shared Function DecodeDeliverPdu(pduHex As String, ByRef msg As InboxMessage) As Boolean
+        msg = New InboxMessage()
+        Dim data As Byte() = HexToBytes(If(pduHex, String.Empty).Trim())
+        If data Is Nothing OrElse data.Length < 1 Then Return False
+        Dim pos As Integer = 0
+        Dim smscLen As Integer = data(pos)
+        pos = 1 + smscLen
+        If pos + 1 >= data.Length Then Return False
+        Dim firstOctet As Integer = data(pos)
+        Dim udhi As Boolean = (firstOctet And &H40) <> 0
+        ' (Round 76W) A2: MTI bits 1-0 must be 00 (SMS-DELIVER). A stored
+        ' STATUS-REPORT (10) or SUBMIT (01) PDU must never decode as an inbox row.
+        If (firstOctet And 3) <> 0 Then Return False
+        pos += 1
+        ' Originating address.
+        Dim oaLen As Integer = data(pos)
+        pos += 1
+        If pos >= data.Length Then Return False
+        Dim oaType As Integer = data(pos)
+        pos += 1
+        ' (Round 76W) A1: oaLen is a DIGIT count for a numeric OA but a
+        ' SEPTET count for an alphanumeric OA (TS 23.040 9.2.3.8) - the
+        ' octet count differs: ceil(septets*7/8), not (digits+1)\2.
+        Dim oaIsAlpha As Boolean = (oaType And &H70) = &H50
+        Dim oaOctets As Integer = If(oaIsAlpha, (oaLen * 7 + 7) \ 8, (oaLen + 1) \ 2)
+        If pos + oaOctets > data.Length Then Return False
+        If oaIsAlpha Then
+            ' Alphanumeric sender id: oaLen septets packed in oaOctets.
+            msg.FromNumber = UnpackGsm7Bit(data, pos * 8, oaLen)
+        Else
+            ' (Round 76W) A4: every OA digit nibble must be BCD 0-9; a
+            ' 0xA nibble is malformed, never a ':' inside the number.
+            Dim d As Integer = 0
+            While d < oaLen
+                Dim nib As Integer = If((d Mod 2) = 0, data(pos + d \ 2) And &HF, (data(pos + d \ 2) >> 4) And &HF)
+                If nib > 9 Then Return False
+                d += 1
+            End While
+            Dim digits As String = SemiOctetsToDigits(data, pos, oaLen)
+            msg.FromNumber = If(oaType = &H91, "+" & digits, digits)
+        End If
+        pos += oaOctets
+        If pos + 10 > data.Length Then Return False
+        pos += 1 ' PID.
+        Dim dcs As Integer = data(pos)
+        pos += 1
+        ' Service-centre timestamp: 7 semi-octet bytes YY MM DD hh mm ss tz.
+        Dim yy As Integer = BcdSemiOctet(data(pos))
+        Dim mo As Integer = BcdSemiOctet(data(pos + 1))
+        Dim dd As Integer = BcdSemiOctet(data(pos + 2))
+        Dim hh As Integer = BcdSemiOctet(data(pos + 3))
+        Dim mm As Integer = BcdSemiOctet(data(pos + 4))
+        Dim ss As Integer = BcdSemiOctet(data(pos + 5))
+        Dim tzByte As Integer = data(pos + 6)
+        pos += 7
+        ' (Round 76W) A4: BcdSemiOctet returns -1 for a non-BCD nibble, so
+        ' hh/mm/ss are checked < 0 as well (a 0xF nibble used to slip through).
+        If yy < 0 OrElse mo < 1 OrElse mo > 12 OrElse dd < 1 OrElse dd > 31 OrElse hh < 0 OrElse hh > 23 OrElse mm < 0 OrElse mm > 59 OrElse ss < 0 OrElse ss > 59 Then Return False
+        ' (TS 23.040 9.2.3.11) Timezone octet: units = high nibble, tens = low-nibble bits 0-2, sign = bit 3 (0x08).
+        ' (Round 76W) A4: the units nibble must be BCD (0-9) and the value
+        ' within +/-48 quarters; 0xF8 is malformed, never -03:45.
+        Dim tzSignNeg As Boolean = (tzByte And &H8) <> 0
+        Dim tzUnits As Integer = (tzByte >> 4) And &HF
+        If tzUnits > 9 Then Return False
+        Dim tzQuarters As Integer = ((tzByte And &H7) * 10) + tzUnits
+        If tzSignNeg Then tzQuarters = -tzQuarters
+        If Math.Abs(tzQuarters) > 48 Then Return False
+        Dim tzSign As String = If(tzQuarters < 0, "-", "+")
+        Dim tzAbs As Integer = Math.Abs(tzQuarters)
+        msg.TimeText = String.Format("{0:0000}-{1:00}-{2:00} {3:00}:{4:00}:{5:00} {6}{7:00}:{8:00}", 2000 + yy, mo, dd, hh, mm, ss, tzSign, tzAbs \ 4, (tzAbs Mod 4) * 15)
+        If pos >= data.Length Then Return False
+        Dim udl As Integer = data(pos)
+        pos += 1
+        Dim udStart As Integer = pos
+        Dim udLen As Integer = data.Length - udStart
+        If udLen < 0 Then Return False
+        ' (Round 76W) A3: bits 3-2 select the alphabet only in DCS groups
+        ' 00xx/01xx (TS 23.038 4). Group 1100/1101 (message waiting) is
+        ' always GSM 7-bit, 1110 always UCS2, reserved 1000-1011 GSM 7-bit,
+        ' and group 1111 uses bit 2 (1 = 8-bit data, 0 = GSM 7-bit).
+        Dim dcsKind As Integer = dcs And &HC
+        If dcs >= &H80 Then
+            If (dcs And &HF0) = &HE0 Then
+                dcsKind = &H8
+            ElseIf (dcs And &HF0) = &HF0 Then
+                dcsKind = If((dcs And &H4) <> 0, &H4, 0)
+            Else
+                dcsKind = 0
+            End If
+        End If
+        If dcsKind = &H8 Then
+            ' UCS2: UDL is in octets; skip the UDH in octets.
+            If udl > udLen Then Return False
+            Dim textStart As Integer = udStart
+            Dim textLen As Integer = udl
+            If udhi Then
+                If udLen < 1 Then Return False
+                Dim udhl As Integer = data(udStart)
+                textStart = udStart + 1 + udhl
+                textLen = udl - 1 - udhl
+                If textLen < 0 Then Return False
+            End If
+            If textStart + textLen > data.Length Then Return False
+            ' (Round 76W) A4: an odd UCS2 length is malformed, never silently truncated.
+            If (textLen Mod 2) <> 0 Then Return False
+            msg.Text = System.Text.Encoding.BigEndianUnicode.GetString(data, textStart, textLen)
+        ElseIf dcsKind = &H4 Then
+            ' 8-bit data: UDL is in octets; skip the UDH in octets; Latin-1 maps bytes 1:1.
+            If udl > udLen Then Return False
+            Dim textStart As Integer = udStart
+            Dim textLen As Integer = udl
+            If udhi Then
+                If udLen < 1 Then Return False
+                Dim udhl As Integer = data(udStart)
+                textStart = udStart + 1 + udhl
+                textLen = udl - 1 - udhl
+                If textLen < 0 Then Return False
+            End If
+            If textStart + textLen > data.Length Then Return False
+            msg.Text = System.Text.Encoding.GetEncoding("ISO-8859-1").GetString(data, textStart, textLen)
+        Else
+            ' GSM 7-bit: UDL is in septets; the UDH occupies ((UDHL+1)*8+6)\7 septets (fill bit included).
+            ' (Round 76W) A4: UDL septets must fit in the bytes actually present.
+            If udl > (udLen * 8) \ 7 Then Return False
+            Dim skipSeptets As Integer = 0
+            If udhi Then
+                If udLen < 1 Then Return False
+                skipSeptets = ((data(udStart) + 1) * 8 + 6) \ 7
+            End If
+            Dim textSeptets As Integer = udl - skipSeptets
+            If textSeptets < 0 Then Return False
+            msg.Text = UnpackGsm7Bit(data, udStart * 8 + skipSeptets * 7, textSeptets)
+        End If
+        Return True
+    End Function
+
+    ''' <summary>Parses a raw AT+CMGL=4 reply into inbox messages. Each "+CMGL: &lt;idx&gt;,&lt;stat&gt;,,&lt;len&gt;" line is followed
+    ''' by one PDU hex line; unparseable entries are skipped (the rest still list). A reply with no +CMGL: lines
+    ''' (empty inbox, or an error) yields an empty list.</summary>
+    Public Shared Function ParseCmglReply(reply As String) As List(Of InboxMessage)
+        Dim result As New List(Of InboxMessage)()
+        If String.IsNullOrEmpty(reply) Then Return result
+        Dim lines As String() = reply.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).Split(New Char() {ChrW(10)}, StringSplitOptions.RemoveEmptyEntries)
+        Dim i As Integer = 0
+        While i < lines.Length
+            Dim line As String = lines(i).Trim()
+            If line.StartsWith("+CMGL:", StringComparison.Ordinal) Then
+                Dim head As String = line.Substring(6).Trim()
+                Dim parts As String() = head.Split(","c)
+                Dim idx As Integer = 0
+                Dim stat As Integer = -1
+                If parts.Length >= 2 AndAlso Integer.TryParse(parts(0).Trim(), idx) AndAlso Integer.TryParse(parts(1).Trim(), stat) Then
+                    If i + 1 < lines.Length Then
+                        Dim pduHex As String = lines(i + 1).Trim()
+                        Dim msg As InboxMessage = Nothing
+                        If DecodeDeliverPdu(pduHex, msg) Then
+                            msg.Index = idx
+                            msg.Status = InboxStatusLabel(stat)
+                            result.Add(msg)
+                        End If
+                        i += 1
+                    End If
+                End If
+            End If
+            i += 1
+        End While
+        Return result
+    End Function
+
+    ''' <summary>Reads the SIM inbox (AT+CMGL=4, PDU mode) on the already-open port. Returns the messages in modem
+    ''' order; on failure returns Nothing and errorText explains (port closed, PDU mode refused, +CMS ERROR).
+    ''' A fresh read every call - nothing is cached and nothing is deleted or marked read.</summary>
+    Public Function ReadInboxSms(ByRef errorText As String, Optional stopPredicate As Func(Of Boolean) = Nothing) As List(Of InboxMessage)
+        errorText = String.Empty
+        If _port Is Nothing OrElse Not _port.IsOpen Then
+            errorText = "المنفذ غير مفتوح"
+            Return Nothing
+        End If
+        Dim modeReply As String = SendCommand("AT+CMGF=0", "OK", 5000, stopPredicate)
+        If Not ReplyMatchesExpected(modeReply, "OK") Then
+            errorText = "تعذر ضبط وضع PDU (AT+CMGF=0)" & If(String.IsNullOrWhiteSpace(modeReply), " — لا يوجد رد", " — رد المودم: " & modeReply.Trim())
+            Return Nothing
+        End If
+        Dim reply As String = SendCommand("AT+CMGL=4", "OK", 15000, stopPredicate)
+        If String.IsNullOrWhiteSpace(reply) Then
+            errorText = "تعذرت قراءة الوارد (AT+CMGL=4) — لا يوجد رد"
+            Return Nothing
+        End If
+        Dim messages As List(Of InboxMessage) = ParseCmglReply(reply)
+        If messages.Count > 0 Then Return messages
+        If LineStartsWith(reply, "+CMS ERROR") OrElse LineStartsWith(reply, "+CME ERROR") OrElse LineStartsWith(reply, "ERROR") Then
+            errorText = "تعذرت قراءة الوارد: " & reply.Trim()
+            Return Nothing
+        End If
+        ' No +CMGL: lines and no error: the inbox is empty.
+        Return messages
+    End Function
+
     ''' <summary>
     ''' Sends ESC (followed by CR, so it can never be buffered into the
     ''' next command line) to abort a stale "&gt;" prompt left by an
@@ -4443,22 +4855,71 @@ Public Class ModemSender
                 ' window, and repeating it wastes the 200-char
                 ' window.
                 Dim drainFinal As String = DrainFinalResultLines(lateDrainedText) & vbCrLf & DrainFinalResultLines(drainProbeText, includeBareError:=False)
-                Dim timeoutReply As String = BuildTimeoutReply(response, graceText, drainFinal)
+                ' (Round 76) D-L1/B-L1: a bare OK in the 3 s drain is the submit's
+                ' late answer - the drain holds unsolicited bytes only (the AT
+                ' probe's OK is separate in drainProbeText), so it counts exactly
+                ' like an OK in the wait or grace window. Mine it into drainFinal
+                ' too, so the reply suffix shows it instead of "لا يوجد رد".
+                Dim drainHasOk As Boolean = ReplyHasTerminalOk(lateDrainedText)
+                If drainHasOk Then drainFinal = If(String.IsNullOrWhiteSpace(drainFinal), "OK", drainFinal & vbCrLf & "OK")
+                Dim timeoutReply As String = BuildTimeoutReply(response, graceText, drainFinal, lateDrainedText)
                 If timeoutReply.Length > 200 Then timeoutReply = timeoutReply.Substring(0, 200)
                 Dim timeoutReplySuffix As String = If(timeoutReply = String.Empty, " — رد المودم: لا يوجد رد", " — رد المودم: " & timeoutReply)
                 result.Success = False
+                ' (Round 76) A-L1/D-L1: the submit's fate is UNKNOWN - never a
+                ' definite failure - when Ctrl-Z went out and no terminal result
+                ' answers it anywhere: either the modem answered OK with no
+                ' +CMGS: (wait, grace or drain) or it answered no terminal line
+                ' at all, only unsolicited lines like BOOT:/^RSSI:. An error
+                ' anywhere still beats an OK anywhere, and a non-OK final line
+                ' (NO CARRIER, BUSY, ...) still fails definitely in the Else
+                ' below. A +CMGS: line cannot reach here uncounted (it was
+                ' counted above), so it can only ever keep unknownFate False.
+                ' (Round 77) R76-A-L2/D-O1: DrainFinalResultLines now
+                ' mines those non-OK final lines from the drain too,
+                ' so the claim above holds for drain arrivals as well.
+                Dim hasTerminalError As Boolean = ReplyHasTerminalError(response) OrElse ReplyHasTerminalError(graceText) OrElse ReplyHasTerminalError(drainFinal)
+                Dim hasTerminalOk As Boolean = ReplyHasTerminalOk(response) OrElse ReplyHasTerminalOk(graceText) OrElse drainHasOk
+                Dim hasAnyTerminalLine As Boolean = HasFinalResultLine(response) OrElse HasFinalResultLine(graceText) OrElse HasFinalResultLine(drainFinal)
+                Dim unknownFate As Boolean = ctrlZSent AndAlso Not hasTerminalError AndAlso (hasTerminalOk OrElse Not hasAnyTerminalLine)
                 ' (Round 57) C-55-L2: a drain final-result line IS a
                 ' reply, so it takes the reply-failure template
                 ' below (which keeps the suffix on a late-credit
                 ' rebuild) instead of the "قد تكون الرسالة أُرسلت"
                 ' template, which would contradict the error shown.
-                If String.IsNullOrWhiteSpace(response) AndAlso String.IsNullOrWhiteSpace(graceText) AndAlso String.IsNullOrWhiteSpace(drainFinal) Then
+                If String.IsNullOrWhiteSpace(response) AndAlso String.IsNullOrWhiteSpace(graceText) AndAlso String.IsNullOrWhiteSpace(drainFinal) AndAlso String.IsNullOrWhiteSpace(lateDrainedText) Then
                     ' Timeout with no reply at all: the segment may
                     ' still have been sent, so say so explicitly.
                     ' FIX B-NEW-L1 (Round 27): re-send warning clause
                     ' added - the count was here, the warning was not,
                     ' unlike every sibling partial-failure message.
+                    ' (Round 77) R76-A-L1: total silence is the
+                    ' limiting case of the unknownFate rule below
+                    ' (Ctrl-Z out + no terminal line anywhere) —
+                    ' but this branch fires first, so the flag must
+                    ' be set here too when Ctrl-Z went out. A row
+                    ' whose Ctrl-Z never went out stays a definite
+                    ' failure. (Round 77) R76-D-L1: the branch now
+                    ' also requires the raw drain text to be empty —
+                    ' unsolicited drain bytes are a reply, so the
+                    ' flow must reach the ElseIf below instead.
+                    If ctrlZSent Then result.Unconfirmed = True
                     result.Message = "انتهت المهلة — قد تكون الرسالة أُرسلت (تم إرسال " & result.SegmentsSent.ToString() & " من " & result.SegmentsTotal.ToString() & " رسائل منفصلة قبل الفشل) — إعادة الإرسال ستعيد إرسال المقاطع التي تم إرسالها" & If(sawCmgsWithoutOk, " (بدون تأكيد OK)", String.Empty) & timeoutReplySuffix
+                ElseIf unknownFate Then
+                    ' (Round 75) LIVE 2026-11-23: OK without +CMGS:
+                    ' Ctrl-Z went out, the modem answered OK, the
+                    ' grace + drain found no +CMGS: and no error —
+                    ' the segment MAY have been sent (jony received
+                    ' it: reply "OK BOOT:32264700,0,0,0,87 ^RSSI:15").
+                    ' Fate UNKNOWN: never a definite failure, never
+                    ' counted sent — the caller reports it as
+                    ' unconfirmed (see SmsResult.Unconfirmed).
+                    ' (Round 76) A-L1/D-L1: the same unknown fate when
+                    ' the modem answered no terminal line at all, only
+                    ' unsolicited lines, or its OK arrived only in the
+                    ' 3 s drain (see unknownFate above).
+                    result.Unconfirmed = True
+                    result.Message = "لم يتم تأكيد الإرسال — قد تكون الرسالة أُرسلت (تم إرسال " & result.SegmentsSent.ToString() & " من " & result.SegmentsTotal.ToString() & " رسائل منفصلة) — إعادة الإرسال ستعيد إرسال المقاطع التي تم إرسالها" & If(sawCmgsWithoutOk, " (بدون تأكيد OK)", String.Empty) & timeoutReplySuffix
                 Else
                     result.Message = "تم إرسال " & result.SegmentsSent.ToString() & " من " & result.SegmentsTotal.ToString() & " (رسائل منفصلة) قبل الفشل" & If(result.SegmentsSent > 0 OrElse cmgsErrorTrailed, " — إعادة الإرسال ستعيد إرسال المقاطع التي تم إرسالها", String.Empty) & If(sawCmgsWithoutOk, " (بدون تأكيد OK)", String.Empty) & timeoutReplySuffix  ' (Round 33) B-observation: reply failure - modem gave a terminal reply and grace+drain found no +CMGS:, segment not sent; clause when prior Sent>0 or on an error-trailed +CMGS: refusal (Round 45 B-H2).
                 End If

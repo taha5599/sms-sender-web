@@ -446,6 +446,8 @@ Public Module BridgeMain
         Select Case req.Method & " " & path
             Case "GET /api/status"
                 Return BridgeApi.ApiStatus(req)
+            Case "GET /api/inbox"
+                Return BridgeApi.ApiInbox(req)
             Case "GET /api/ports"
                 Return BridgeApi.ApiPorts(req)
             Case "POST /api/detect"
