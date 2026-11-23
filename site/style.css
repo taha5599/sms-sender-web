@@ -286,3 +286,12 @@ input[type="text"]#bridgeAddressInput {
 
 /* (R78) C-77-L1: mixed-content warning - amber like the excluded tag. */
 .warn { color: #8a6d1b; background: #fdf6e0; border: 1px solid rgba(201, 162, 39, 0.4); border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 8px 0; }
+
+/* (R75W) inbox list — same card treatment as the modem list. */
+.inbox-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.inbox-msg { border: 1px solid rgba(31, 27, 22, 0.16); border-radius: 8px; padding: 10px 12px; background: #ffffff; }
+.inbox-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 13px; color: #7b7266; }
+.inbox-from { font-weight: 600; color: #1f1b16; font-family: var(--mono); }
+.inbox-time { font-family: var(--mono); }
+.inbox-status { color: #8a6d1b; }
+.inbox-text { margin-top: 6px; white-space: pre-wrap; overflow-wrap: break-word; }

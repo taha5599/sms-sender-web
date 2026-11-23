@@ -149,6 +149,16 @@ function api(path, opts) {
     body: opts.body || undefined
   }).then(function (res) {
     return res.json().then(function (data) {
+      // (R77W) C-76W-L1: a null / non-object / array body is a malformed
+      // response, not an empty result - reject it with a friendly Arabic
+      // error instead of leaking a JS engine TypeError (or silently
+      // rendering an empty inbox) to every api() caller.
+      if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+        var bad = new Error('رد الوسيط غير صالح');
+        bad.status = res.status;
+        bad.data = data;
+        throw bad;
+      }
       if (!res.ok || data.ok === false) {
         var msg = (data && data.error) ? data.error : ('خطأ ' + res.status);
         var err = new Error(msg);
@@ -157,6 +167,16 @@ function api(path, opts) {
         throw err;
       }
       return data;
+    }, function () {
+      // (R78W) C-77W-L1: res.json() itself rejects on a non-JSON or
+      // empty body (HTML error page from a broken proxy, truncated
+      // response) - convert it to the same friendly Arabic error
+      // instead of leaking the SyntaxError verbatim. Rejection
+      // handler (not .catch) so the guard's own error and the
+      // bridge's error message above are never swallowed.
+      var bad = new Error('رد الوسيط غير صالح');
+      bad.status = res.status;
+      throw bad;
     });
   });
 }
@@ -395,10 +415,10 @@ function pollProgress() {
   api('/api/progress?job=' + encodeURIComponent(currentJobId)).then(function (data) {
     var total = data.total || 0;
     // (Round 61) C-60-M1/A-60-L1: stopped rows count toward done, so the bar reaches 100% on a stop.
-    var done = (data.sent || 0) + (data.failed || 0) + (data.cancelled || 0);
+    var done = (data.sent || 0) + (data.failed || 0) + (data.cancelled || 0) + (data.unconfirmed || 0); // (Round 80P) P2: unconfirmed rows count toward done, so the bar reaches 100%.
     var pct = total > 0 ? Math.round(done / total * 100) : 0;
     $('progressFill').style.width = pct + '%';
-    $('progressText').textContent = done + ' / ' + total + ' — نجح ' + (data.sent || 0) + '، فشل ' + (data.failed || 0) + ((data.cancelled || 0) > 0 ? '، أُوقف ' + data.cancelled : '') + (data.stopped ? ' — تم الإيقاف' : '');
+    $('progressText').textContent = done + ' / ' + total + ' — نجح ' + (data.sent || 0) + '، فشل ' + (data.failed || 0) + ((data.cancelled || 0) > 0 ? '، أُوقف ' + data.cancelled : '') + ((data.unconfirmed || 0) > 0 ? '، لم يتم تأكيد ' + data.unconfirmed + ' (قد تكون أُرسلت — تحقق قبل إعادة الإرسال)' : '') + ((data.unconfirmedPartial || 0) > 0 ? ' (منها ' + data.unconfirmedPartial + ' أُرسلت مقاطع قبل عدم التأكيد — إعادة الإرسال ستعيد إرسال المقاطع التي تم إرسالها)' : '') + (data.stopped ? ' — تم الإيقاف' : ''); // (Round 80P) P2: unconfirmed totals clause, mirrors the desktop summary.
     var mh = '';
     (data.modems || []).forEach(function (m) {
       var state = m.status === 'dead' ? ' — توقف: ' + m.reason
@@ -406,7 +426,7 @@ function pollProgress() {
         : m.status === 'done' ? ' — انتهى'
         : (m.current ? ' — يرسل ' + m.current : ' — جارٍ');
       mh += '<div class="modem-progress ' + m.status + '"><strong>' + escapeHtml(m.port) + '</strong>: نجح '
-        + m.sent + '، فشل ' + m.failed + ((m.cancelled || 0) > 0 ? '، أُوقف ' + m.cancelled : '') + escapeHtml(state) + '</div>'; // (Round 62) B-61-L1: per-modem stopped rows read "أُوقف", not "فشل".
+        + m.sent + '، فشل ' + m.failed + ((m.cancelled || 0) > 0 ? '، أُوقف ' + m.cancelled : '') + ((m.unconfirmed || 0) > 0 ? '، لم يتم تأكيد ' + m.unconfirmed : '') + escapeHtml(state) + '</div>'; // (Round 80P) P2: per-modem unconfirmed, mirrors the desktop per-modem line. // (Round 62) B-61-L1: per-modem stopped rows read "أُوقف", not "فشل".
     });
     $('modemProgress').innerHTML = mh;
     $('logBox').innerHTML = (data.log || []).map(escapeHtml).join('<br>');
@@ -416,7 +436,7 @@ function pollProgress() {
     (data.results || []).forEach(function (r, i) {
       rh += '<tr><td>' + (i + 1) + '</td><td dir="ltr">' + escapeHtml(r.number) + '</td>'
         + '<td>' + escapeHtml(r.port || '—') + '</td>'
-        + '<td>' + (r.ok ? 'تم' : (r.cancelled ? 'تم الإيقاف' : 'فشل')) + '</td>' // (Round 61) C-60-M1: stopped rows read "تم الإيقاف", not "فشل".
+        + '<td>' + (r.ok ? 'تم' : (r.cancelled ? 'تم الإيقاف' : (r.unconfirmed ? 'لم يتم التأكيد' : 'فشل'))) + '</td>' // (Round 61) C-60-M1: stopped rows read "تم الإيقاف", not "فشل".
         + '<td>' + escapeHtml(r.message || '') + '</td></tr>';
     });
     tbody.innerHTML = rh;
@@ -443,6 +463,59 @@ function stopJob() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jobId: currentJobId })
   }).catch(function (err) { showError('تعذر الإيقاف: ' + err.message); });
+}
+
+/* ---------------- inbox (R75W) ---------------- */
+
+/* Read-only inbox: a fresh GET /api/inbox read on every refresh (the
+   bridge reads AT+CMGL=4 live each time — nothing cached, nothing
+   deleted or marked read). Reuses api() so the call carries the
+   X-SmsBridge header and the configured bridge address. */
+/* (Round 76W) C-L2: Arabic plural for the inbox count. */
+function inboxCountText(n) {
+  if (n === 1) return '1 رسالة';
+  if (n === 2) return '2 رسالتان';
+  return n + ' رسائل';
+}
+
+function loadInbox() {
+  var btn = $('btnRefreshInbox');
+  btn.disabled = true;
+  $('inboxStatus').textContent = 'جارٍ قراءة الوارد…';
+  $('inboxError').classList.add('hidden');
+  api('/api/inbox').then(function (data) {
+    /* (Round 76W) C-L3: a missing messages field means an empty inbox
+       (as before); a present-but-not-array payload is malformed and
+       fails with a friendly Arabic error, never a raw JS engine
+       message; null entries inside the array are skipped. */
+    var raw = (data && data.messages !== undefined) ? data.messages : [];
+    if (!Array.isArray(raw)) throw new Error('رد الوسيط غير صالح');
+    var msgs = raw.filter(function (m) { return m !== null && typeof m === 'object'; });
+    /* (Round 76W) C-L2: correct Arabic plural, and the port only when present. */
+    $('inboxStatus').textContent = msgs.length === 0 ? '' : inboxCountText(msgs.length) + ((data && data.port) ? ' — المنفذ ' + data.port : '');
+    if (msgs.length === 0) {
+      $('inboxList').innerHTML = '<p class="empty">لا توجد رسائل واردة على الشريحة.</p>';
+    } else {
+      var html = '';
+      msgs.forEach(function (m) {
+        html += '<div class="inbox-msg"><div class="inbox-head">'
+          + '<span class="inbox-from" dir="ltr">' + escapeHtml(m.from) + '</span>'
+          + '<span class="inbox-time" dir="ltr">' + escapeHtml(m.time) + '</span>'
+          + '<span class="inbox-status">' + escapeHtml(m.status) + '</span></div>'
+          + '<div class="inbox-text">' + escapeHtml(m.text) + '</div></div>';
+      });
+      $('inboxList').innerHTML = html;
+    }
+  }).catch(function (err) {
+    $('inboxError').textContent = 'تعذرت قراءة الوارد: ' + err.message;
+    $('inboxError').classList.remove('hidden');
+    $('inboxStatus').textContent = '';
+    /* (Round 76W) C-L1: never present a stale list as current after a
+       failed refresh - clear it and say the last read failed. */
+    $('inboxList').innerHTML = '<p class="empty">لا توجد بيانات واردة معروضة — آخر محاولة قراءة فشلت.</p>';
+  }).finally(function () {
+    btn.disabled = false;
+  });
 }
 
 /* ---------------- misc ---------------- */
@@ -501,6 +574,7 @@ $('btnRecheck').addEventListener('click', function () { checkBridge(true); });
 $('btnRefreshPorts').addEventListener('click', loadPorts);
 $('btnDetect').addEventListener('click', detectModems);
 $('btnTest').addEventListener('click', testSelected);
+$('btnRefreshInbox').addEventListener('click', loadInbox);
 $('btnPreview').addEventListener('click', previewFile);
 $('btnSend').addEventListener('click', sendJob);
 $('btnStop').addEventListener('click', stopJob);
