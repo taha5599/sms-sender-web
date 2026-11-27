@@ -468,9 +468,10 @@ function stopJob() {
 /* ---------------- inbox (R75W) ---------------- */
 
 /* Read-only inbox: a fresh GET /api/inbox read on every refresh (the
-   bridge reads AT+CMGL=4 live each time — nothing cached, nothing
-   deleted or marked read). Reuses api() so the call carries the
-   X-SmsBridge header and the configured bridge address. */
+   bridge sweeps all storages — AT+CPMS=? then AT+CMGL=4 per storage —
+   live each time; nothing cached, nothing deleted or marked read).
+   Reuses api() so the call carries the X-SmsBridge header and the
+   configured bridge address. */
 /* (Round 76W) C-L2: Arabic plural for the inbox count. */
 function inboxCountText(n) {
   if (n === 1) return '1 رسالة';
@@ -491,8 +492,12 @@ function loadInbox() {
     var raw = (data && data.messages !== undefined) ? data.messages : [];
     if (!Array.isArray(raw)) throw new Error('رد الوسيط غير صالح');
     var msgs = raw.filter(function (m) { return m !== null && typeof m === 'object'; });
-    /* (Round 76W) C-L2: correct Arabic plural, and the port only when present. */
-    $('inboxStatus').textContent = msgs.length === 0 ? '' : inboxCountText(msgs.length) + ((data && data.port) ? ' — المنفذ ' + data.port : '');
+    /* (Round 76W) C-L2: correct Arabic plural, and the port only when present.
+       (R82W) per-storage notes ("SM: 2؛ ME: 0...") when present — shown even on an
+       empty list, so a partial storage failure leaves a visible hint. */
+    var statusText = msgs.length === 0 ? '' : inboxCountText(msgs.length) + ((data && data.port) ? ' — المنفذ ' + data.port : '');
+    if (data && data.notes) statusText += (statusText ? ' — ' : '') + data.notes;
+    $('inboxStatus').textContent = statusText;
     if (msgs.length === 0) {
       $('inboxList').innerHTML = '<p class="empty">لا توجد رسائل واردة على الشريحة.</p>';
     } else {
@@ -501,7 +506,8 @@ function loadInbox() {
         html += '<div class="inbox-msg"><div class="inbox-head">'
           + '<span class="inbox-from" dir="ltr">' + escapeHtml(m.from) + '</span>'
           + '<span class="inbox-time" dir="ltr">' + escapeHtml(m.time) + '</span>'
-          + '<span class="inbox-status">' + escapeHtml(m.status) + '</span></div>'
+          + '<span class="inbox-status">' + escapeHtml(m.status) + '</span>'
+          + ((m.storage) ? '<span class="inbox-storage">' + escapeHtml(m.storage) + '</span>' : '') + '</div>'
           + '<div class="inbox-text">' + escapeHtml(m.text) + '</div></div>';
       });
       $('inboxList').innerHTML = html;
