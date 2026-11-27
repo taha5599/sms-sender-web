@@ -135,6 +135,7 @@ Public Module BridgeApi
         End If
         Dim messages As List(Of ModemSender.InboxMessage) = Nothing
         Dim inboxError As String = String.Empty
+        Dim inboxNotes As String = String.Empty ' (R82W) per-storage counts from the last ReadInboxSms call
         Try
             Using modem As New ModemSender()
                 Dim openOk As Boolean = False
@@ -147,6 +148,7 @@ Public Module BridgeApi
                     Return ErrorResponse(500, "فشل فتح المنفذ " & target.PortName & " (المودم لم يرد على أوامر AT/ATE0)")
                 End If
                 messages = modem.ReadInboxSms(inboxError, Nothing)
+                inboxNotes = modem.InboxReadNotes
             End Using
         Catch ex As Exception
             Return ErrorResponse(500, "خطأ أثناء قراءة الوارد: " & ex.Message)
@@ -165,10 +167,13 @@ Public Module BridgeApi
             sb.Append("""status"":").Append(JsonStr(m.Status)).Append(",")
             sb.Append("""from"":").Append(JsonStr(m.FromNumber)).Append(",")
             sb.Append("""time"":").Append(JsonStr(m.TimeText)).Append(",")
-            sb.Append("""text"":").Append(JsonStr(m.Text))
+            sb.Append("""text"":").Append(JsonStr(m.Text)).Append(",")
+            ' (R82W) Storage tag: the storage this message came from (SM/ME/MT; empty on the CPMS-fallback read).
+            sb.Append("""storage"":").Append(JsonStr(m.Storage))
             sb.Append("}")
         Next
-        sb.Append("]}")
+        ' (R82W) Per-storage counts/notes (empty when the read fell back to the single default storage).
+        sb.Append("],").Append("""notes"":").Append(JsonStr(inboxNotes)).Append("}")
         Return JsonResponse(200, sb.ToString())
     End Function
 

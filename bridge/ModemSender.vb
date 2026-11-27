@@ -3799,6 +3799,10 @@ Public Class ModemSender
         Public Property FromNumber As String = String.Empty
         Public Property TimeText As String = String.Empty
         Public Property Text As String = String.Empty
+        ' (Fixer F) Which message storage the row was read from
+        ' (SM / ME / MT). Empty when the read ran on the modem
+        ' default storage (pre-CPMS fallback).
+        Public Property Storage As String = String.Empty
     End Class
 
     Private Shared Function InboxStatusLabel(stat As Integer) As String
@@ -4081,20 +4085,71 @@ Public Class ModemSender
         Return result
     End Function
 
-    ''' <summary>Reads the SIM inbox (AT+CMGL=4, PDU mode) on the already-open port. Returns the messages in modem
-    ''' order; on failure returns Nothing and errorText explains (port closed, PDU mode refused, +CMS ERROR).
-    ''' A fresh read every call - nothing is cached and nothing is deleted or marked read.</summary>
-    Public Function ReadInboxSms(ByRef errorText As String, Optional stopPredicate As Func(Of Boolean) = Nothing) As List(Of InboxMessage)
+    ' (Fixer F) Per-storage notes from the last ReadInboxSms call
+    ' (e.g. "SM: 1، ME: 1، MT: 0" or a select failure), for the
+    ' caller's log line. Empty when the fallback single read ran.
+    Public Property InboxReadNotes As String = String.Empty
+
+    ''' <summary>(Fixer F) Parses an AT+CPMS=? reply into the supported
+    ''' message storages, in modem order (e.g. "+CPMS: ("SM","ME","MT"),..."
+    ''' -> SM, ME, MT). Only the first group (mem1, the read store)
+    ''' is used. Returns an empty list when the reply carries no
+    ''' usable storage names. Pure logic, no port.</summary>
+    Public Shared Function ParseCpmsTestReply(reply As String) As List(Of String)
+        Dim result As New List(Of String)()
+        If String.IsNullOrEmpty(reply) Then Return result
+        Dim start As Integer = reply.IndexOf("+CPMS:", StringComparison.Ordinal)
+        If start < 0 Then Return result
+        Dim openParen As Integer = reply.IndexOf("("c, start)
+        Dim closeParen As Integer = If(openParen >= 0, reply.IndexOf(")"c, openParen), -1)
+        If openParen < 0 OrElse closeParen < 0 Then Return result
+        Dim group As String = reply.Substring(openParen + 1, closeParen - openParen - 1)
+        For Each part As String In group.Split(","c)
+            Dim name As String = part.Trim().Trim(""""c).Trim()
+            If name.Length > 0 AndAlso Not result.Contains(name) Then result.Add(name)
+        Next
+        Return result
+    End Function
+
+    ''' <summary>(Fixer F) Selects one message storage for read/write/
+    ''' receive (AT+CPMS="m","m","m"); falls back to the one-argument
+    ''' form (AT+CPMS="m") when the modem rejects the three-argument
+    ''' form. Returns True when the modem answered OK to either form.</summary>
+    Private Function SelectInboxStorage(storage As String, Optional stopPredicate As Func(Of Boolean) = Nothing) As Boolean
+        Dim three As String = SendCommand("AT+CPMS=""" & storage & """,""" & storage & """,""" & storage & """", "OK", 5000, stopPredicate)
+        If ReplyMatchesExpected(three, "OK") Then Return True
+        Dim one As String = SendCommand("AT+CPMS=""" & storage & """", "OK", 5000, stopPredicate)
+        Return ReplyMatchesExpected(one, "OK")
+    End Function
+
+    ''' <summary>(Fixer F) Merges per-storage inbox reads in the given
+    ''' order, tagging each row with its storage. Rows are deduped by
+    ''' storage+index (indices collide across storages). Pure logic,
+    ''' no port.</summary>
+    Public Shared Function MergeInboxStorages(ordered As List(Of KeyValuePair(Of String, List(Of InboxMessage)))) As List(Of InboxMessage)
+        Dim merged As New List(Of InboxMessage)()
+        If ordered Is Nothing Then Return merged
+        Dim seen As New HashSet(Of String)()
+        For Each pair As KeyValuePair(Of String, List(Of InboxMessage)) In ordered
+            If pair.Value Is Nothing Then Continue For
+            For Each msg As InboxMessage In pair.Value
+                If msg Is Nothing Then Continue For
+                Dim key As String = pair.Key & "|" & msg.Index.ToString()
+                If Not seen.Add(key) Then Continue For
+                msg.Storage = pair.Key
+                merged.Add(msg)
+            Next
+        Next
+        Return merged
+    End Function
+
+    ''' <summary>(Fixer F) Reads the inbox from the currently selected
+    ''' storage (AT+CMGL=4, PDU mode). Extracted unchanged from
+    ''' ReadInboxSms: same replies, same error strings. Returns Nothing
+    ''' on failure (errorText explains); an empty list means the storage
+    ''' is empty.</summary>
+    Private Function ReadInboxFromCurrentStorage(ByRef errorText As String, Optional stopPredicate As Func(Of Boolean) = Nothing) As List(Of InboxMessage)
         errorText = String.Empty
-        If _port Is Nothing OrElse Not _port.IsOpen Then
-            errorText = "المنفذ غير مفتوح"
-            Return Nothing
-        End If
-        Dim modeReply As String = SendCommand("AT+CMGF=0", "OK", 5000, stopPredicate)
-        If Not ReplyMatchesExpected(modeReply, "OK") Then
-            errorText = "تعذر ضبط وضع PDU (AT+CMGF=0)" & If(String.IsNullOrWhiteSpace(modeReply), " — لا يوجد رد", " — رد المودم: " & modeReply.Trim())
-            Return Nothing
-        End If
         Dim reply As String = SendCommand("AT+CMGL=4", "OK", 15000, stopPredicate)
         If String.IsNullOrWhiteSpace(reply) Then
             errorText = "تعذرت قراءة الوارد (AT+CMGL=4) — لا يوجد رد"
@@ -4109,6 +4164,234 @@ Public Class ModemSender
         ' No +CMGL: lines and no error: the inbox is empty.
         Return messages
     End Function
+
+    ''' <summary>Reads the SIM/modem inbox on the already-open port.
+    ''' (Fixer F) Storage-aware: AT+CPMS=? lists the supported storages
+    ''' and each of SM, ME, MT (supported only) is selected and read with
+    ''' AT+CMGL=4, merging the rows (deduped by storage+index, each row
+    ''' tagged with its storage). When the CPMS query fails the old
+    ''' single read on the modem default storage runs instead. A fresh
+    ''' read every call - nothing is cached and nothing is deleted or
+    ''' marked read. On failure returns Nothing and errorText explains.</summary>
+    Public Function ReadInboxSms(ByRef errorText As String, Optional stopPredicate As Func(Of Boolean) = Nothing) As List(Of InboxMessage)
+        errorText = String.Empty
+        InboxReadNotes = String.Empty
+        If _port Is Nothing OrElse Not _port.IsOpen Then
+            errorText = "المنفذ غير مفتوح"
+            Return Nothing
+        End If
+        Dim modeReply As String = SendCommand("AT+CMGF=0", "OK", 5000, stopPredicate)
+        If Not ReplyMatchesExpected(modeReply, "OK") Then
+            errorText = "تعذر ضبط وضع PDU (AT+CMGF=0)" & If(String.IsNullOrWhiteSpace(modeReply), " — لا يوجد رد", " — رد المودم: " & modeReply.Trim())
+            Return Nothing
+        End If
+        Dim supported As List(Of String) = Nothing
+        Dim cpmsReply As String = SendCommand("AT+CPMS=?", "OK", 5000, stopPredicate)
+        If ReplyMatchesExpected(cpmsReply, "OK") Then supported = ParseCpmsTestReply(cpmsReply)
+        If supported Is Nothing OrElse supported.Count = 0 Then
+            ' (Fixer F) The modem does not answer the storage query:
+            ' fall back to the old single read on the default storage.
+            Return ReadInboxFromCurrentStorage(errorText, stopPredicate)
+        End If
+        Dim ordered As New List(Of KeyValuePair(Of String, List(Of InboxMessage)))()
+        Dim notes As New System.Text.StringBuilder()
+        Dim anyRead As Boolean = False
+        For Each storage As String In New String() {"SM", "ME", "MT"}
+            If Not supported.Contains(storage) Then Continue For
+            If Not SelectInboxStorage(storage, stopPredicate) Then
+                notes.Append(storage).Append(": تعذر الاختيار؛ ")
+                Continue For
+            End If
+            Dim perError As String = String.Empty
+            Dim list As List(Of InboxMessage) = ReadInboxFromCurrentStorage(perError, stopPredicate)
+            If list Is Nothing Then
+                notes.Append(storage).Append(": ").Append(perError).Append("؛ ")
+                Continue For
+            End If
+            anyRead = True
+            ordered.Add(New KeyValuePair(Of String, List(Of InboxMessage))(storage, list))
+            notes.Append(storage).Append(": ").Append(list.Count.ToString()).Append("؛ ")
+        Next
+        InboxReadNotes = notes.ToString().Trim()
+        If Not anyRead Then
+            errorText = "تعذرت قراءة الوارد من كل التخزينات — " & InboxReadNotes
+            Return Nothing
+        End If
+        Return MergeInboxStorages(ordered)
+    End Function
+
+    ''' <summary>(Fixer F) One USSD session step result.</summary>
+    Public Class UssdResult
+        Public Property Text As String = String.Empty
+        ' True when the network waits for more input (m=1): the caller
+        ' shows a follow-up input and sends it with SendUssd.
+        Public Property NeedsMoreInput As Boolean
+        Public Property ErrorText As String = String.Empty
+        Public Property RawReply As String = String.Empty
+    End Class
+
+    ''' <summary>(Fixer F) Decodes a +CUSD string by its DCS: 72 = UCS2 hex,
+    ''' 4 = 8-bit data (Latin-1), anything else = GSM 7-bit packed hex.
+    ''' A string that is not hex at all is returned as-is (some modems
+    ''' send plain text). Pure logic, no port.</summary>
+    Public Shared Function DecodeCusdString(str As String, dcs As Integer) As String
+        If String.IsNullOrEmpty(str) Then Return String.Empty
+        Dim bytes As Byte() = HexToBytes(str.Trim())
+        If bytes Is Nothing Then Return str
+        If dcs = 72 Then
+            ' UCS2: whole 16-bit units only; a trailing odd byte cannot
+            ' form a character and is dropped, never shown as '?'.
+            Dim evenLen As Integer = bytes.Length - (bytes.Length Mod 2)
+            If evenLen <= 0 Then Return String.Empty
+            Return System.Text.Encoding.BigEndianUnicode.GetString(bytes, 0, evenLen)
+        ElseIf dcs = 4 Then
+            Return System.Text.Encoding.GetEncoding("ISO-8859-1").GetString(bytes)
+        End If
+        ' GSM 7-bit packed: septets fill the bytes; trailing NUL
+        ' septets are packing padding, never message text.
+        Dim septets As Integer = (bytes.Length * 8) \ 7
+        If septets <= 0 Then Return String.Empty
+        Return UnpackGsm7Bit(bytes, 0, septets).TrimEnd(ChrW(0))
+    End Function
+
+    ''' <summary>(Fixer F) Finds the +CUSD: line in a modem reply and
+    ''' decodes it into result (Text, NeedsMoreInput for m=1). Returns
+    ''' False when the reply holds no +CUSD: line at all. Pure logic,
+    ''' no port.</summary>
+    Public Shared Function ParseCusdReply(reply As String, ByRef result As UssdResult) As Boolean
+        result = New UssdResult()
+        If String.IsNullOrEmpty(reply) Then Return False
+        result.RawReply = reply.Trim()
+        For Each line As String In SplitLines(reply)
+            Dim t As String = line.Trim()
+            If Not t.StartsWith("+CUSD:", StringComparison.OrdinalIgnoreCase) Then Continue For
+            Dim rest As String = t.Substring(6).Trim()
+            Dim m As Integer = 0
+            Dim comma As Integer = rest.IndexOf(","c)
+            If comma < 0 Then
+                If Not Integer.TryParse(rest, m) Then Return False
+                result.NeedsMoreInput = (m = 1)
+                Return True
+            End If
+            If Not Integer.TryParse(rest.Substring(0, comma).Trim(), m) Then Return False
+            result.NeedsMoreInput = (m = 1)
+            Dim firstQuote As Integer = rest.IndexOf(""""c, comma)
+            Dim lastQuote As Integer = rest.LastIndexOf(""""c)
+            If firstQuote < 0 OrElse lastQuote <= firstQuote Then Return True
+            Dim str As String = rest.Substring(firstQuote + 1, lastQuote - firstQuote - 1)
+            Dim dcs As Integer = 15
+            Dim after As String = rest.Substring(lastQuote + 1).Trim()
+            If after.StartsWith(",", StringComparison.Ordinal) Then
+                Dim dcsText As String = after.Substring(1).Trim()
+                Dim parsed As Integer = 0
+                If Integer.TryParse(dcsText, parsed) Then dcs = parsed
+            End If
+            result.Text = DecodeCusdString(str, dcs)
+            Return True
+        Next
+        Return False
+    End Function
+
+    ''' <summary>(Fixer F) Reads the port briefly for a late +CUSD: line
+    ''' (some networks answer OK first and send the USSD text as a later
+    ''' URC). Returns everything read; bytes that are not part of a
+    ''' +CUSD: line are re-preserved for the next command instead of
+    ''' being dropped.</summary>
+    Private Function GraceReadForCusd(timeoutMs As Integer) As String
+        Dim buffer As New System.Text.StringBuilder()
+        If _port Is Nothing OrElse Not _port.IsOpen Then Return String.Empty
+        buffer.Append(TakePreservedText())
+        Dim watch As New System.Diagnostics.Stopwatch()
+        watch.Start()
+        While watch.ElapsedMilliseconds < timeoutMs
+            Dim chunk As String = String.Empty
+            Try
+                chunk = _port.ReadExisting()
+            Catch ex As Exception
+                System.Diagnostics.Debug.WriteLine("CUSD grace read failed: " & ex.Message)
+                Exit While
+            End Try
+            If Not String.IsNullOrEmpty(chunk) Then buffer.Append(chunk)
+            If LineStartsWith(buffer.ToString(), "+CUSD:") Then Exit While
+            Threading.Thread.Sleep(100)
+        End While
+        Dim text As String = buffer.ToString()
+        If Not LineStartsWith(text, "+CUSD:") AndAlso Not String.IsNullOrEmpty(text) Then
+            ' (Fixer G) C-81D-L1: a final error line IS an answer, not
+            ' leftovers - return it so SendUssd's grace error check
+            ' can fire instead of reporting a timeout. Only non-error,
+            ' non-CUSD text is re-preserved for the next read.
+            If LineStartsWith(text, "+CME ERROR") OrElse LineStartsWith(text, "+CMS ERROR") OrElse LineStartsWith(text, "ERROR") Then
+                Return text
+            End If
+            AppendPreservedFragment(text)
+            Return String.Empty
+        End If
+        Return text
+    End Function
+
+    ''' <summary>(Fixer F) Sends one USSD step (AT+CUSD=1,"code",15) on the
+    ''' already-open port and waits up to timeoutMs for the +CUSD:
+    ''' reply (the network may answer in two parts: an OK first, then
+    ''' the +CUSD line - a short grace read covers that). Returns the
+    ''' decoded text and whether the session waits for more input
+    ''' (NeedsMoreInput). On failure ErrorText explains in Arabic and
+    ''' Text is empty. Never cancels the session itself - use
+    ''' CancelUssd for that.</summary>
+    Public Function SendUssd(codeOrInput As String, ByRef errorText As String, Optional timeoutMs As Integer = 60000) As UssdResult
+        errorText = String.Empty
+        Dim result As New UssdResult()
+        If _port Is Nothing OrElse Not _port.IsOpen Then
+            errorText = "المنفذ غير مفتوح"
+            result.ErrorText = errorText
+            Return result
+        End If
+        Dim code As String = If(codeOrInput, String.Empty).Replace(vbCr, String.Empty).Replace(vbLf, String.Empty).Replace("""", String.Empty)
+        If String.IsNullOrWhiteSpace(code) Then
+            errorText = "اكتب كود USSD أولاً"
+            result.ErrorText = errorText
+            Return result
+        End If
+        Dim reply As String = SendCommand("AT+CUSD=1,""" & code & """,15", "OK", Math.Max(5000, timeoutMs), Nothing)
+        Dim parsed As New UssdResult()
+        If ParseCusdReply(reply, parsed) Then Return parsed
+        If LineStartsWith(reply, "+CME ERROR") OrElse LineStartsWith(reply, "+CMS ERROR") OrElse LineStartsWith(reply, "ERROR") Then
+            errorText = "رفض المودم/الشبكة طلب USSD: " & reply.Trim()
+            result.ErrorText = errorText
+            result.RawReply = reply.Trim()
+            Return result
+        End If
+        ' No +CUSD: line yet and no error: the network may still be
+        ' answering (OK first, +CUSD: as a later URC) - grace-read
+        ' briefly for the late line before calling it a timeout.
+        Dim grace As String = GraceReadForCusd(5000)
+        If ParseCusdReply(grace, parsed) Then Return parsed
+        If LineStartsWith(grace, "+CME ERROR") OrElse LineStartsWith(grace, "+CMS ERROR") OrElse LineStartsWith(grace, "ERROR") Then
+            errorText = "رفض المودم/الشبكة طلب USSD: " & grace.Trim()
+            result.ErrorText = errorText
+            result.RawReply = (reply & vbCrLf & grace).Trim()
+            Return result
+        End If
+        errorText = "انتهت المهلة — لم يصل رد USSD من الشبكة"
+        result.ErrorText = errorText
+        result.RawReply = (reply & vbCrLf & grace).Trim()
+        Return result
+    End Function
+
+    ''' <summary>(Fixer F) Cancels an active USSD session (AT+CUSD=2).
+    ''' Returns True when the modem answered OK.</summary>
+    Public Function CancelUssd(ByRef errorText As String) As Boolean
+        errorText = String.Empty
+        If _port Is Nothing OrElse Not _port.IsOpen Then
+            errorText = "المنفذ غير مفتوح"
+            Return False
+        End If
+        Dim reply As String = SendCommand("AT+CUSD=2", "OK", 15000, Nothing)
+        If ReplyMatchesExpected(reply, "OK") Then Return True
+        errorText = "تعذر إلغاء جلسة USSD" & If(String.IsNullOrWhiteSpace(reply), " — لا يوجد رد", " — رد المودم: " & reply.Trim())
+        Return False
+    End Function
+
 
     ''' <summary>
     ''' Sends ESC (followed by CR, so it can never be buffered into the
